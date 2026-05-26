@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+requests
+pydantic
+python-dotenv
+selenium
+pandas
+pyautogui
+mysql-connector-python
+pymongo
+google-api-python-client
