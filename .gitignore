@@ -1,0 +1,7 @@
+.env
+*.env
+__pycache__/
+*.pyc
+new_account_cookies.pkl
+logs/
+.vscode/
