@@ -44,8 +44,8 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
         # Query de inserción
         insert_query = """
         INSERT INTO po_review_details 
-        (po_number, mfrid, part_number, qty, ideal_cost, supplier_price, status, error_message, superseded_from)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        (po_number, mfrid, part_number, qty, ideal_cost, supplier_price, available_qty, status, error_message, superseded_from)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         
         # Insertar cada fila
@@ -60,6 +60,11 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
                 supplier_price_value = item.get('your_price')
                 if supplier_price_value is None:
                     supplier_price_value = 0.0
+
+                # Usar available del scraping, si es None usar 0
+                available_qty_value = item.get('available')
+                if available_qty_value is None:
+                    available_qty_value = 0
                 
                 # Preparar valores para inserción
                 values = (
@@ -69,6 +74,7 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
                     item['qty'],
                     ideal_cost_value,  # ideal_cost del servicio o list_price del scraping
                     supplier_price_value,  # supplier_price = Your Price o 0.0
+                    available_qty_value,  # available_qty = Available del scraping o 0
                     item['status'],
                     item.get('error_message'),
                     item.get('superseded_from')  # Parte original antes del reemplazo del proveedor

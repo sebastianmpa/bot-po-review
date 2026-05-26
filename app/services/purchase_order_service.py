@@ -184,10 +184,10 @@ def process_single_purchase_order(po_data: PurchaseOrderDataModel, chunkId: str)
             if supplier_price is None:
                 supplier_price = 0.0
             
-            # Determinar status comparando ideal_cost vs supplier_price
+            # Determinar status para respuesta al chunk
             status = "CORRECT"
             if item['status'] == 'PART_ERROR':
-                status = "MISMATCH"
+                status = "PART_ERROR"
                 item['status'] = 'PART_ERROR'  # Valor del enum en BD
             elif supplier_price > 0 and ideal_cost > 0:
                 difference = abs(ideal_cost - float(supplier_price))
@@ -204,7 +204,7 @@ def process_single_purchase_order(po_data: PurchaseOrderDataModel, chunkId: str)
                     item['status'] = 'CORRECT'
                     print(f"✅ CORRECT - Precios coinciden para {part_number}")
             elif supplier_price == 0 and ideal_cost > 0:
-                status = "MISMATCH"
+                status = "PART_ERROR"
                 item['status'] = 'PART_ERROR'  # Sin precio = error de parte, valor del enum en BD
                 if not item.get('error_message'):
                     item['error_message'] = f"No supplier price available for {part_number}"
@@ -215,17 +215,16 @@ def process_single_purchase_order(po_data: PurchaseOrderDataModel, chunkId: str)
                 status = "SUPERSEDED"
                 print(f"🔄 SUPERSEDED - {part_number} reemplazado por: {item.get('superseded_from')}")
             
-            # Agregar a respuesta solo si tiene precio válido
-            if supplier_price > 0:
-                response_product = PurchaseOrderResponseProduct(
-                    mfrid=item['mfrid'],
-                    partNumber=part_number,
-                    qty=item['qty'],
-                    idealCost=ideal_cost if ideal_cost > 0 else 0.0,
-                    supplierPrice=float(supplier_price),
-                    status=status
-                )
-                response_products.append(response_product)
+            # Agregar SIEMPRE a la respuesta del chunk (éxito o error)
+            response_product = PurchaseOrderResponseProduct(
+                mfrid=item['mfrid'],
+                partNumber=part_number,
+                qty=item['qty'],
+                idealCost=ideal_cost if ideal_cost > 0 else 0.0,
+                supplierPrice=float(supplier_price) if supplier_price is not None else 0.0,
+                status=status
+            )
+            response_products.append(response_product)
         
         # 6. Guardar en BD
         print("💾 Guardando datos en la base de datos...")
@@ -242,6 +241,7 @@ def process_single_purchase_order(po_data: PurchaseOrderDataModel, chunkId: str)
         print(f"📊 Total productos en respuesta: {len(response_products)}")
         print(f"✅ Status CORRECT: {sum(1 for p in response_products if p.status == 'CORRECT')}")
         print(f"⚠️ Status MISMATCH: {sum(1 for p in response_products if p.status == 'MISMATCH')}")
+        print(f"❌ Status PART_ERROR: {sum(1 for p in response_products if p.status == 'PART_ERROR')}")
         
         return response_data
         
@@ -305,8 +305,10 @@ def start_purchase_order_automation(request: SeoCategoryRequestModel):
     print(f"📦 Total de órdenes: {len(purchase_orders)}")
     print("="*60)
     
+    all_responses = []
+    processing_errors = []
+
     try:
-        all_responses = []
         
         # Procesar cada orden de compra
         for idx, po_data in enumerate(purchase_orders, 1):
@@ -314,14 +316,45 @@ def start_purchase_order_automation(request: SeoCategoryRequestModel):
             print(f"📦 Procesando orden {idx}/{len(purchase_orders)}")
             print(f"{'='*60}\n")
             
-            po_response = process_single_purchase_order(po_data, request.chunkId)
-            all_responses.append(po_response)
+            try:
+                po_response = process_single_purchase_order(po_data, request.chunkId)
+                all_responses.append(po_response)
+            except Exception as po_error:
+                print(f"❌ Error procesando PO {po_data.poNumber}: {po_error}")
+
+                # Incluir también la PO fallida en la respuesta al chunk
+                failed_products = []
+                for product in po_data.products:
+                    failed_products.append(
+                        PurchaseOrderResponseProduct(
+                            mfrid=product.mfrid,
+                            partNumber=product.partNumber,
+                            qty=product.qty,
+                            idealCost=product.idealCost,
+                            supplierPrice=0.0,
+                            status="PART_ERROR"
+                        )
+                    )
+
+                all_responses.append(
+                    PurchaseOrderResponseData(
+                        poNumber=po_data.poNumber,
+                        supplerID=po_data.supplerID,
+                        products=failed_products
+                    )
+                )
+                processing_errors.append({
+                    "poNumber": po_data.poNumber,
+                    "message": str(po_error)
+                })
         
         # Crear respuesta final
+        final_status = "Failed" if processing_errors else "Success"
+
         response = ResponseBlogModel(
             chunkId=request.chunkId,
             item=all_responses,
-            status="Success"
+            status=final_status
         )
         
         # Enviar al chunk API
@@ -335,26 +368,33 @@ def start_purchase_order_automation(request: SeoCategoryRequestModel):
         print("\n" + "="*60)
         print("✅ PROCESO COMPLETADO - Todas las órdenes procesadas")
         print(f"📊 Total órdenes procesadas: {len(all_responses)}")
+        print(f"❌ Órdenes con error: {len(processing_errors)}")
         print("="*60)
         
         return response.dict()
         
     except Exception as e:
         print(f"❌ Error durante la automatización: {e}")
-        
-        # Respuesta de error
-        response = ResponseBlogModel(
-            chunkId=request.chunkId,
-            item=[],
-            status="Failed"
-        )
-        
+
+        # Respuesta de error: incluir todo lo que ya se alcanzó a procesar
+        processed_orders = [po.model_dump() for po in all_responses]
+        error_item = {
+            "message": str(e),
+            "orders": processed_orders
+        }
+
+        error_payload = {
+            "chunkId": request.chunkId,
+            "item": error_item,
+            "status": "Failed"
+        }
+
         try:
-            register_chunk_item(response.dict())
+            register_chunk_item(error_payload)
         except Exception as chunk_error:
             print(f"⚠️ No se pudo enviar error al chunk API: {chunk_error}")
-        
-        return response.dict()
+
+        return error_payload
     """
     Servicio principal para procesar órdenes de compra.
     

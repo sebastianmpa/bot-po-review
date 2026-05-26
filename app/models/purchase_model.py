@@ -52,13 +52,18 @@ class ResponseBlogModel(BaseModel):
     def dict(self, *args, **kwargs):
         """Override dict() para serializar correctamente el modelo al chunk API.
         - chunkId: tal cual llega
-        - item: objeto con la primera (y normalmente única) PO
+        - item: siempre objeto (nunca array)
         - status: 'Success' o 'Failed' según requiere la API
         """
         # Serializar cada PO usando model_dump para evitar doble escape
         items_list = [po.model_dump() for po in self.item]
-        # La API espera item como objeto, no array. Si hay varias POs se toma la primera.
-        item_obj = items_list[0] if len(items_list) == 1 else items_list
+        # La API espera item como objeto, no array
+        if len(items_list) == 0:
+            item_obj = {"products": []}
+        elif len(items_list) == 1:
+            item_obj = items_list[0]
+        else:
+            item_obj = {"orders": items_list}
         # Capitalizar status: 'success' -> 'Success', 'failed' -> 'Failed'
         status_value = self.status.capitalize()
         return {
