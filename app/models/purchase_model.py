@@ -1,5 +1,10 @@
 from pydantic import BaseModel
 from typing import List, Optional, Union
+from datetime import datetime
+
+
+def build_state_date() -> str:
+    return datetime.now().isoformat()
 
 class PurchaseOrderItemModel(BaseModel):
     mfrid: str  # Mapea a MANUFACTURER en el CSV
@@ -69,5 +74,6 @@ class ResponseBlogModel(BaseModel):
         return {
             "chunkId": self.chunkId,
             "item": item_obj,
-            "status": status_value
+            "status": status_value,
+            "state_date": build_state_date()
         }

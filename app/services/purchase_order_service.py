@@ -10,7 +10,8 @@ from models.purchase_model import (
     ResponseBlogModel, 
     PurchaseOrderResponseProduct,
     PurchaseOrderResponseData,
-    PurchaseOrderDataModel
+    PurchaseOrderDataModel,
+    build_state_date
 )
 from seo_scripts.gardner_login_playwright import gardner_login_automation_playwright
 from seo_scripts.insert_data_in_db import insert_po_review_details, get_po_review_summary
@@ -386,7 +387,8 @@ def start_purchase_order_automation(request: SeoCategoryRequestModel):
         error_payload = {
             "chunkId": request.chunkId,
             "item": error_item,
-            "status": "Failed"
+            "status": "Failed",
+            "state_date": build_state_date()
         }
 
         try:
