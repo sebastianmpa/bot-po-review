@@ -1,7 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks
 from models.purchase_model import SeoCategoryRequestModel
 from services.purchase_order_service import start_purchase_order_automation
-from threading import Lock
+from threading import Lock, Thread
 import logging
 import json
 
@@ -88,17 +88,24 @@ def run_purchase_order_service_in_background(request: SeoCategoryRequestModel):
     Ejecuta el servicio de órdenes de compra en segundo plano y libera el estado al finalizar.
     """
     global is_running
-    try:
-        logger.info("🚀 Iniciando procesamiento en segundo plano...")
-        start_purchase_order_automation(request)
-        logger.info("✅ Procesamiento completado exitosamente.")
-    except Exception as e:
-        logger.error(f"❌ Error en el procesamiento: {e}")
-    finally:
-        # Liberar el estado del servicio
-        with service_lock:
-            is_running = False
-        logger.info("🔓 Servicio liberado para nuevas solicitudes.")
+
+    def _worker():
+        global is_running
+        try:
+            logger.info("🚀 Iniciando procesamiento en segundo plano...")
+            start_purchase_order_automation(request)
+            logger.info("✅ Procesamiento completado exitosamente.")
+        except Exception as e:
+            logger.error(f"❌ Error en el procesamiento: {e}")
+        finally:
+            # Liberar el estado del servicio
+            with service_lock:
+                is_running = False
+            logger.info("🔓 Servicio liberado para nuevas solicitudes.")
+
+    # Ejecutar en un hilo dedicado para aislar Playwright Sync del event loop de FastAPI
+    worker_thread = Thread(target=_worker, name="purchase-order-worker", daemon=True)
+    worker_thread.start()
 
 
 @router.post("/debug-purchase-order-request")
