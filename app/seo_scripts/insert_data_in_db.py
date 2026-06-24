@@ -2,8 +2,9 @@
 Script para insertar los datos de scraping en la base de datos po_review_details.
 """
 
+import json
 import logging
-from typing import List, Dict
+from typing import List, Dict, Optional
 from decimal import Decimal
 import sys
 import os
@@ -11,11 +12,125 @@ import os
 # Agregar el directorio padre al path para imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.bd_mysql import get_db_connection
+from utils.bd_mysql import get_db_connection, get_pg_connection
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def lookup_product_in_databases(part_number: str, mfrid: Optional[str] = None) -> Dict:
+    """
+    Busca un part_number en prontoweb.product (MySQL ERP).
+    Devuelve un dict con pack_qty si lo encuentra, {} si no.
+    """
+    result: Dict = {}
+
+    # ── MySQL (ERP prontoweb.product) ─────────────────────────────
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(dictionary=True)
+        query = """
+            SELECT
+                PARTNUMBER      AS part_number,
+                MFRID           AS mfrid,
+                DESCRIPTION     AS description,
+                PACKAGEQUANTITY AS pack_qty
+            FROM prontoweb.product
+            WHERE PARTNUMBER = %s
+        """
+        params = [part_number]
+        if mfrid:
+            query += " AND MFRID = %s"
+            params.append(mfrid)
+        query += " LIMIT 1"
+        cur.execute(query, params)
+        row = cur.fetchone()
+        if row:
+            result.update({k: v for k, v in row.items() if v is not None})
+            logger.info(f"🔍 MySQL ERP: encontrado '{part_number}' → pack_qty={row.get('pack_qty')}")
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"⚠️  MySQL lookup falló para '{part_number}': {e}")
+
+    if not result:
+        logger.debug(f"  ∅  Sin datos en MySQL para '{part_number}'")
+
+    return result
+
+
+def lookup_crossovers_and_packs(mfrid: str, part_number: str) -> Dict:
+    """
+    Busca crossovers y packs en PostgreSQL para un part dado.
+    Devuelve {'crossover': [...] | None, 'pack_codes': [...] | None}
+    """
+    result: Dict = {'crossover': None, 'pack_codes': None}
+
+    try:
+        conn = get_pg_connection()
+        cur = conn.cursor()
+
+        # ── Crossovers ────────────────────────────────────────────
+        cur.execute(
+            """
+            SELECT mfr_cross, partnumber_cross, priority, notes
+            FROM product_crossover
+            WHERE mfr = %s AND partnumber = %s
+            ORDER BY priority
+            """,
+            (mfrid, part_number)
+        )
+        rows = cur.fetchall()
+        if rows:
+            result['crossover'] = [
+                {
+                    'mfr':        row[0],
+                    'partnumber': row[1],
+                    'priority':   row[2],
+                    'notes':      row[3] or ''
+                }
+                for row in rows
+            ]
+
+        # ── Packs ─────────────────────────────────────────────────
+        cur.execute(
+            """
+            SELECT mfr_pack, partnumber_pack, pack_qty, notes
+            FROM product_packs
+            WHERE mfr = %s AND partnumber = %s
+            """,
+            (mfrid, part_number)
+        )
+        rows = cur.fetchall()
+        if rows:
+            result['pack_codes'] = [
+                {
+                    'mfr':        row[0],
+                    'partnumber': row[1],
+                    'pack_qty':   row[2],
+                    'notes':      row[3] or ''
+                }
+                for row in rows
+            ]
+
+        cur.close()
+        conn.close()
+
+        n_cross = len(result['crossover'] or [])
+        n_packs = len(result['pack_codes'] or [])
+        if n_cross or n_packs:
+            logger.info(
+                f"🔗 '{mfrid}/{part_number}': "
+                f"{n_cross} crossover(s), {n_packs} pack(s)"
+            )
+
+    except Exception as e:
+        logger.warning(
+            f"⚠️  Crossover/Pack lookup falló para '{mfrid}/{part_number}': {e}"
+        )
+
+    return result
 
 
 def insert_po_review_details(scraped_data: List[Dict]) -> int:
@@ -44,13 +159,65 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
         # Query de inserción
         insert_query = """
         INSERT INTO po_review_details 
-        (po_number, mfrid, part_number, qty, ideal_cost, supplier_price, available_qty, status, error_message, superseded_from)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        (po_number, mfrid, mfrid_orig, part_number, partnumber_orig, qty, ideal_cost, supplier_price, available_qty, in_stock, status, error_message, superseded_from, nla, pack_qty, ltl, supplier_code, pack_codes, crossover)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         
         # Insertar cada fila
         for item in scraped_data:
             try:
+                # ── Enriquecer con datos de las BDs ──────────────────────────────
+                part_number_lookup = item.get('part_number', '')
+                mfrid_lookup = item.get('mfrid', '')
+                supplier_code = item.get('supplier_code', '')
+                crossover_json = None
+                pack_codes_json = None
+
+                # Mapeo supplier_code → MFRID preferido en PostgreSQL
+                SUPPLIER_MFRID_MAP = {
+                    'HU': 'HUS',   # Husqvarna
+                    'SP': 'BRS',   # Briggs & Stratton
+                    'GA': 'HST',   # Gardner (Hustler)
+                    'FO': 'WALB',  # Florida Outdoor (Walbro)
+                }
+
+                if part_number_lookup:
+                    # MySQL ERP: pack_qty fallback + MFRID resolution
+                    db_data = lookup_product_in_databases(part_number_lookup, mfrid_lookup)
+                    if db_data:
+                        enriched = []
+                        if item.get('pack_qty') is None and db_data.get('pack_qty'):
+                            item['pack_qty'] = db_data['pack_qty']
+                            enriched.append(f"pack_qty={db_data['pack_qty']}")
+                        if enriched:
+                            logger.info(f"✨ Enriquecido '{part_number_lookup}': {', '.join(enriched)}")
+
+                    # Resolver MFRID para lookup en PostgreSQL:
+                    # Prioridad: 1) item.mfrid  2) supplier_code map  3) ERP fallback
+                    if not mfrid_lookup:
+                        mfrid_lookup = SUPPLIER_MFRID_MAP.get(supplier_code, '')
+                        if mfrid_lookup:
+                            logger.debug(f"  🏷️  MFRID desde supplier_map: '{mfrid_lookup}' ({supplier_code}) para '{part_number_lookup}'")
+                        elif db_data and db_data.get('mfrid'):
+                            mfrid_lookup = db_data['mfrid']
+                            logger.info(f"  🏷️  MFRID resuelto desde ERP: '{mfrid_lookup}' para '{part_number_lookup}'")
+
+                    # PostgreSQL: crossovers y packs (usa mfrid del ERP si el item no lo trae)
+                    if mfrid_lookup:
+                        cp_data = lookup_crossovers_and_packs(mfrid_lookup, part_number_lookup)
+                        if cp_data['crossover']:
+                            crossover_json = json.dumps(cp_data['crossover'])
+                        if cp_data['pack_codes']:
+                            pack_codes_json = json.dumps(cp_data['pack_codes'])
+
+                # ── Mapear status al valor aceptado por la columna BD ────────────
+                # La columna 'status' acepta: CORRECT, PART_ERROR, SUPERSEDED, PRICE_MISMATCH
+                raw_status = item['status']
+                status_map = {
+                    'MISMATCH': 'PRICE_MISMATCH',
+                    'NLA':      'PART_ERROR',
+                }
+                db_status = status_map.get(raw_status, raw_status)
                 # Usar ideal_cost del item si existe, sino list_price del scraping
                 ideal_cost_value = item.get('ideal_cost') if 'ideal_cost' in item else item.get('list_price')
                 if ideal_cost_value is None:
@@ -61,23 +228,35 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
                 if supplier_price_value is None:
                     supplier_price_value = 0.0
 
-                # Usar available del scraping, si es None usar 0
-                available_qty_value = item.get('available')
-                if available_qty_value is None:
-                    available_qty_value = 0
+                # Usar qty_available del scraping, si no existe usar 0
+                available_qty_value = item.get('qty_available', 0)
+
+                # in_stock: 'Y'/'N' — si no viene del scraper, derivar de qty_available
+                in_stock_value = item.get('in_stock')
+                if in_stock_value is None:
+                    in_stock_value = 'Y' if available_qty_value > 0 else 'N'
                 
                 # Preparar valores para inserción
                 values = (
                     item['po_number'],
-                    item['mfrid'],
+                    item.get('mfrid'),
+                    item.get('mfrid_orig'),
                     item['part_number'],
+                    item.get('partnumber_orig') or item['part_number'],  # partnumber_orig
                     item['qty'],
-                    ideal_cost_value,  # ideal_cost del servicio o list_price del scraping
-                    supplier_price_value,  # supplier_price = Your Price o 0.0
-                    available_qty_value,  # available_qty = Available del scraping o 0
-                    item['status'],
+                    ideal_cost_value,
+                    supplier_price_value,
+                    available_qty_value,
+                    in_stock_value,
+                    db_status,
                     item.get('error_message'),
-                    item.get('superseded_from')  # Parte original antes del reemplazo del proveedor
+                    item.get('superseded_from'),
+                    item.get('nla'),           # "Y" o None
+                    item.get('pack_qty'),      # int o None
+                    item.get('ltl'),           # "Y" o None
+                    item.get('supplier_code'), # GA, HU, SP, FO, CP ...
+                    pack_codes_json,           # JSON array o None
+                    crossover_json,            # JSON array o None
                 )
                 
                 # Ejecutar inserción
@@ -86,7 +265,7 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
                 
                 logger.info(
                     f"Insertado: PO={item['po_number']} | "
-                    f"Part={item['part_number']} | Status={item['status']}"
+                    f"Part={item['part_number']} | Status={db_status}"
                 )
                 
             except Exception as e:

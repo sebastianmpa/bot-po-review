@@ -3,7 +3,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from routes.bot_reset_route import router as bot_reset_router
 from routes.purchase_order_route import router as purchase_order_router
-from routes.purchase_execution_route import router as purchase_execution_router
 import logging
 import json
 
@@ -56,8 +55,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # Incluir los routers de productos, categorías y órdenes de compra
 app.include_router(bot_reset_router)
 app.include_router(purchase_order_router)
-app.include_router(purchase_execution_router)
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8015, reload=True)

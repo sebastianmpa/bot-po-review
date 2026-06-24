@@ -19,12 +19,15 @@ def parse_price(price_text: str) -> Optional[Decimal]:
     except Exception:
         return None
 
-
 def extract_table_data(page: Page) -> List[Dict]:
     """
     Extrae todos los datos de la tabla Quick Order después de cargar el CSV.
+    Deduplica por part_number: si múltiples filas tienen el mismo part_number limpio (después de quitar MFRID),
+    mantiene solo la primera ocurrencia para evitar búsquedas duplicadas en Gardner.
     """
     results = []
+    seen_parts: set = set()  # Rastrear part_numbers ya agregados
+    duplicates_removed = 0
     
     try:
         # Esperar a que la tabla esté presente
@@ -41,6 +44,10 @@ def extract_table_data(page: Page) -> List[Dict]:
                 row_class = row.get_attribute('class') or ''
                 has_error = 'q-table-row--error' in row_class
                 
+                # Debug: mostrar contenido de la fila
+                row_text = row.inner_text()
+                print(f"  DEBUG Fila {idx}: {row_text[:100]}")
+                
                 # Extraer MFR Code (col-1 - select option selected)
                 mfr_value = ''
                 try:
@@ -56,8 +63,21 @@ def extract_table_data(page: Page) -> List[Dict]:
                     part_number_input = row.locator('.q-col-2 input')
                     if part_number_input.count() > 0:
                         part_number = part_number_input.get_attribute('value') or ''
-                except:
-                    pass
+                        print(f"    Part Number encontrado: '{part_number}'")
+                    else:
+                        print(f"    No se encontró input en .q-col-2")
+                except Exception as e:
+                    print(f"    Error extrayendo part_number: {e}")
+                
+                # Si la fila tiene error (PART_ERROR), NO quitar las 3 letras aquí
+                # fix_concatenated_part_numbers() DEBE haber corregido esto ya en Gardner
+                # Si aquí aún hay error con MFRID, significa fix_concatenated_part_numbers no funcionó
+                if has_error and part_number and len(part_number) > 3:
+                    potential_mfrid = part_number[:3]
+                    if potential_mfrid.isalpha():
+                        # AQUÍ no deberíamos entrar si fix_concatenated_part_numbers() funcionó
+                        print(f"    ⚠️ ALERTA: Fila {idx} aún tiene MFRID concatenado: {part_number}")
+                        # NO lo limpiamos aquí, solo alertamos
                 
                 # Extraer Quantity (col-3 - input value)
                 qty = 0
@@ -143,6 +163,14 @@ def extract_table_data(page: Page) -> List[Dict]:
                 
                 # Solo agregar filas que tienen part_number
                 if part_number:
+                    # Deduplicación: si ya hemos visto este part_number, omitir
+                    if part_number in seen_parts:
+                        print(f"  ⏭️  Duplicado omitido: {part_number} (ya procesado)")
+                        duplicates_removed += 1
+                        continue
+                    
+                    seen_parts.add(part_number)
+                    
                     row_data = {
                         'mfrid': mfr_value,
                         'part_number': part_number,
@@ -150,10 +178,13 @@ def extract_table_data(page: Page) -> List[Dict]:
                         'item_name': item_name,
                         'list_price': list_price,
                         'your_price': your_price,
-                        'available': available,
+                        'qty_available': available,
+                        'in_stock': 'Y' if available > 0 else 'N',
                         'status': status,
                         'error_message': error_message,
-                        'superseded_from': superseded_from  # Parte original antes del reemplazo
+                        'superseded_from': superseded_from,
+                        'nla': None,       # Se rellena en check_nla_for_errors
+                        'pack_qty': None,  # No aplica para Gardner (QTY viene del CSV)
                     }
                     
                     results.append(row_data)
@@ -163,11 +194,156 @@ def extract_table_data(page: Page) -> List[Dict]:
                 print(f"  ⚠️ Error procesando fila {idx}: {e}")
                 continue
         
+        print(f"📦 Total después de deduplicación: {len(results)} items (duplicados eliminados: {duplicates_removed})")
         return results
         
     except Exception as e:
         print(f"❌ Error extrayendo datos de la tabla: {e}")
         return []
+
+
+def check_nla_for_errors(page: Page, scraped_data: List[Dict]) -> None:
+    """
+    Para cada item con status PART_ERROR, busca el part_number en la barra
+    de búsqueda de Gardner. Si el resultado muestra indicadores de NLA
+    (No Longer Available / Discontinued) → actualiza el item:
+      status       = "NLA"
+      nla          = "Y"
+      error_message = "No Longer Available: {part_number}"
+
+    Modifica scraped_data in-place. El navegador debe estar logueado.
+    """
+    error_items = [item for item in scraped_data if item.get('status') == 'PART_ERROR']
+    if not error_items:
+        print("ℹ️ Sin items PART_ERROR → omitiendo verificación NLA.")
+        return
+
+    print(f"🔍 Verificando NLA para {len(error_items)} item(s) con error...")
+
+    NLA_INDICATORS = [
+        'no longer available',
+        'nla',
+        'discontinued',
+        'not available for purchase',
+        'item is no longer',
+        'product is unavailable',
+    ]
+
+    for item in error_items:
+        part_number = item['part_number']
+        try:
+            search_url = f"https://www.gardnerinc.com/search?q={part_number}"
+            page.goto(search_url, wait_until="domcontentloaded")
+            time.sleep(2)
+
+            page_text = page.content().lower()
+            is_nla = any(indicator in page_text for indicator in NLA_INDICATORS)
+
+            # Verificación adicional: buscar elemento visible con texto NLA
+            if not is_nla:
+                nla_elem = page.locator(
+                    'text="No Longer Available", '
+                    'text="NLA", '
+                    'text="Discontinued"'
+                )
+                is_nla = nla_elem.count() > 0
+
+            if is_nla:
+                item['nla'] = 'Y'
+                item['status'] = 'PART_ERROR'
+                item['error_message'] = f"No Longer Available: {part_number}"
+                print(f"  🚫 NLA confirmado: {part_number}")
+            else:
+                print(f"  ℹ️  No NLA (producto no encontrado): {part_number}")
+
+        except Exception as e:
+            print(f"  ⚠️ Error verificando NLA para {part_number}: {e}")
+
+
+def fix_concatenated_part_numbers(page: Page) -> int:
+    """
+    Detecta filas con q-table-row--error donde el part_number tiene el MFRID concatenado
+    (ej: "HOM30400-Z190110-0000" tiene "HOM" al inicio que no debería estar).
+    
+    Para cada fila con error:
+    1. Quita SIEMPRE las primeras 3 letras (sin importar si hay duplicados)
+    2. Edita el input en Gardner
+    3. Pasa el mouse a la fila de abajo
+    
+    Una vez termina CON TODAS, hace el scraper de nuevo con todos los items.
+    Si queda part_error, se queda así.
+    """
+    fixed = 0
+    
+    try:
+        # Buscar todas las filas con clase 'q-table-row--error'
+        error_rows = page.locator('li.q-table-row--error').all()
+        if not error_rows:
+            print("ℹ️ No hay filas con error para corregir.")
+            return 0
+        
+        print(f"🔧 Quitando MFRID en {len(error_rows)} fila(s) con error...")
+        
+        for idx, row in enumerate(error_rows):
+            try:
+                # Encontrar el input de part_number en esta fila (col-2)
+                pn_input = row.locator('.q-col-2 input').first
+                if not pn_input or pn_input.count() == 0:
+                    continue
+                
+                current_value = (pn_input.get_attribute('value') or '').strip()
+                if not current_value or len(current_value) <= 3:
+                    continue
+                
+                # Quitar las primeras 3 letras (MFRID concatenado) - SIN IMPORTAR DUPLICADOS
+                first_three = current_value[:3]
+                if not first_three.isalpha():
+                    # Las primeras 3 no son letras, probablemente no es MFRID
+                    continue
+                
+                clean_part = current_value[3:]
+                
+                # Editar el input: quitar las 3 letras del MFRID
+                print(f"  🔧 Fila {idx}: '{current_value}' → '{clean_part}'")
+                pn_input.click()                           # Click en el input
+                pn_input.fill('')                          # Limpiar primero
+                pn_input.type(clean_part, delay=50)        # Escribir carácter por carácter
+                time.sleep(0.5)                            # Esperar a que se escriba
+                
+                # Verificar que el valor se actualizó correctamente
+                updated_value = pn_input.get_attribute('value') or ''
+                print(f"    ✓ Input actualizado: '{updated_value}'")
+                
+                # Disparar cambio: Enter para activar búsqueda en Gardner
+                pn_input.press('Enter')
+                time.sleep(1.5)  # Esperar búsqueda en Gardner
+                
+                fixed += 1
+                
+                # ✅ PASAR EL MOUSE A LA FILA DE ABAJO
+                if idx + 1 < len(error_rows):
+                    next_row = error_rows[idx + 1]
+                    next_row.hover()
+                    print(f"    ➡️ Mouse pasado a fila {idx + 1}")
+                    time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"  ⚠️ Error en fila {idx}: {e}")
+                continue
+        
+        # ✅ UNA VEZ TERMINA CON TODAS, HACER EL SCRAPER DE NUEVO
+        if fixed:
+            print(f"\n✅ {fixed} fila(s) corregida(s). Esperando a que Gardner procese...")
+            time.sleep(4)  # Esperar final a que Gardner actualice todo
+            
+            print(f"\n🔄 Haciendo el scraper de nuevo con todos los items...")
+        
+    except Exception as e:
+        print(f"❌ Error en fix_concatenated_part_numbers: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return fixed
 
 
 def gardner_login_automation_playwright(email, password, csv_filename):
@@ -305,12 +481,23 @@ def gardner_login_automation_playwright(email, password, csv_filename):
         # 9. Esperar 7 segundos para que la tabla se cargue completamente
         print("⏳ Esperando 7 segundos para que se cargue la tabla de resultados...")
         time.sleep(7)
-        
+
+        # 9b. Corregir filas donde Gardner concaténó MFRID + part number
+        corrected = fix_concatenated_part_numbers(page)
+        if corrected:
+            print(f"🔄 {corrected} fila(s) corregidas por concatenación MFRID+PN.")
+            # ✅ HACER EL SCRAPER DE NUEVO DESPUÉS DE QUITAR LAS 3 LETRAS
+            print("🔍 Haciendo scraper de nuevo con todos los items (incluidos los corregidos)...")
+            time.sleep(2)
+
         # 10. Hacer scraping de la tabla de resultados
         print("🔍 Iniciando scraping de los resultados...")
         scraped_data = extract_table_data(page)
-        
         print(f"✅ Scraping completado. {len(scraped_data)} filas extraídas.")
+
+        # 11. Verificar NLA para items con PART_ERROR
+        check_nla_for_errors(page, scraped_data)
+
         print("✅ Automatización completa exitosa con Playwright.")
         
         # Cerrar el navegador
@@ -333,7 +520,7 @@ if __name__ == "__main__":
     # Credenciales de acceso
     EMAIL = "jacobn.prontomowers+75145@gmail.com"
     PASSWORD = "Pronto123#"
-    CSV_FILENAME = "92978 csv-1.csv"  # Nombre del archivo CSV en la carpeta de descargas
+    CSV_FILENAME = "PO_93609_GA_20260617_061400.csv"  # Nombre del archivo CSV en la carpeta de descargas
     
     # Ejecutar automatización
     gardner_login_automation_playwright(EMAIL, PASSWORD, CSV_FILENAME)

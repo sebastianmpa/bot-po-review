@@ -11,6 +11,7 @@ class PurchaseOrderItemModel(BaseModel):
     partNumber: str  # Mapea a PART NUMBER en el CSV
     qty: int  # Mapea a QUANTITY en el CSV
     idealCost: float  # Costo ideal del producto
+    mfrid_orig: Optional[str] = None  # Original manufacturer id (nuevo campo)
     definition: Optional[str] = None  # Descripción del producto
 
 class PurchaseOrderDataModel(BaseModel):
@@ -42,7 +43,11 @@ class PurchaseOrderResponseProduct(BaseModel):
     qty: int
     idealCost: float
     supplierPrice: Optional[float] = None
-    status: str  # "CORRECT" o "MISMATCH"
+    status: str           # CORRECT | MISMATCH | PART_ERROR | SUPERSEDED | NLA
+    nla: Optional[str] = None             # "Y" si es No Longer Available
+    supersededFrom: Optional[str] = None  # Part original antes del reemplazo
+    packQty: Optional[int] = None         # Cantidad de pack cuando difiere del solicitado
+    ltl: Optional[str] = None             # "Y" si requiere envío LTL (Motor Freight)
 
 class PurchaseOrderResponseData(BaseModel):
     poNumber: str
