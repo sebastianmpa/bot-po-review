@@ -15,6 +15,67 @@ def _parse_price(text: str):
         return None
 
 
+def _clear_wesco_cart(page) -> None:
+    """
+    Verifica el header span.cc_header_mycart para saber si el carrito tiene
+    ítems.  Si la cantidad es > 0 navega a https://www.wescoturf.com/ccrz__Cart
+    y usa el botón Clear Cart + modal de confirmación para vaciarlo.
+    Se llama ANTES de subir el CSV para evitar contaminación de sesiones
+    anteriores.
+    """
+    print("🔍 Verificando carrito Wesco antes de la carga...")
+    try:
+        # ── Leer el indicador del header (span.cc_header_mycart) ─────────────
+        # Texto ejemplo con ítems: "Cart:\n    101 Items\n   $1,641.55"
+        # Texto ejemplo vacío:     "Cart:\n    0 Items\n   $0.00"
+        cart_span = page.locator('span.cc_header_mycart')
+        cart_items_count = 0
+        if cart_span.count() > 0:
+            raw = cart_span.first.inner_text()
+            # Buscar el primer número que precede a "Items" (puede ser "0" o "101")
+            m = re.search(r'(\d[\d,]*)\s*Items', raw, re.IGNORECASE)
+            if m:
+                cart_items_count = int(m.group(1).replace(',', ''))
+            print(f"  🛒 Header indica {cart_items_count} ítem(s) en el carrito.")
+
+        if cart_items_count == 0:
+            print("  ✅ Carrito Wesco vacío, procediendo.")
+            return
+
+        # ── Hay ítems → ir al carrito y limpiar ──────────────────────────────
+        print(f"  ⚠️ Carrito tiene {cart_items_count} ítem(s). Limpiando...")
+        page.goto("https://www.wescoturf.com/ccrz__Cart", timeout=15000)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        time.sleep(1)
+
+        clear_btn = page.locator('button.clearCart')
+        if clear_btn.count() > 0 and clear_btn.first.is_visible():
+            clear_btn.first.click()
+            try:
+                page.wait_for_selector('#clearAllMod', state='visible', timeout=8000)
+                confirm_btn = page.locator('#clearAllMod input.clearCartItems')
+                if confirm_btn.count() == 0:
+                    confirm_btn = page.locator(
+                        '#clearAllMod input[type="button"][value*="Clear"]'
+                    )
+                confirm_btn.first.click()
+                try:
+                    page.wait_for_load_state('domcontentloaded', timeout=10000)
+                except Exception:
+                    pass
+                time.sleep(2)
+                print("  ✅ Carrito Wesco limpiado antes de la carga.")
+            except Exception as e:
+                print(f"  ⚠️ Error confirmando limpieza del carrito Wesco: {e}")
+        else:
+            print("  ⚠️ Botón 'Clear Cart' no encontrado en el carrito.")
+    except Exception as e:
+        print(f"  ⚠️ Error verificando/limpiando carrito Wesco: {e}")
+
+
 def wesco_automation_playwright(
     username: str,
     password: str,
@@ -88,6 +149,9 @@ def wesco_automation_playwright(
                     time.sleep(2)
             except Exception:
                 raise
+
+        # ── Limpiar carrito antes de la carga ──────────────────────────────────
+        _clear_wesco_cart(page)
 
         # Navigate to bulk order / load dealer order
         # Try to navigate to bulk order / load dealer order safely
@@ -190,8 +254,9 @@ def wesco_automation_playwright(
         current_url = page.url
         print(f"[DEBUG] Current URL after upload: {current_url}")
         
-        # Small extra wait for JavaScript to process
-        time.sleep(1)
+        # Wait for cart items to fully render before scraping
+        print("[DEBUG] Waiting 7s for cart items to fully render...")
+        time.sleep(7)
 
         # Debug mode: capture screenshot and HTML
         if debug:
@@ -269,71 +334,53 @@ def wesco_automation_playwright(
                         qtxt = qty_span.inner_text()
                         qty = int(re.sub(r'[^0-9]', '', qtxt)) if qtxt and re.search(r'\d', qtxt) else 0
 
-                # Extract INDIVIDUAL unit price (NOT the total)
-                # Strategy: Find .price_block container, then get all .cc_value elements
-                # and filter out the one that's in a "Total" section
+                # Extract INDIVIDUAL unit price (NOT the total).
+                # Rules (both handled by the same JS logic):
+                #   SALE case  → cc_value is a direct child of price_block (e.g. "$13.46")
+                #   Normal case→ cc_value is inside the first p.cc_price    (e.g. "$1.13")
+                # In both cases: first .cc_value that is NOT inside the "Total" <p>.
                 your_price = None
                 price_text = None
-                
-                # Get the price block container
+
                 price_block = node.query_selector('.price_block')
                 if price_block:
-                    # Get all .cc_value elements within price_block
-                    cc_values = price_block.query_selector_all('.cc_value')
-                    
-                    for cc_val in cc_values:
-                        try:
-                            # Get the immediate parent .price div
-                            price_parent = cc_val.evaluate('el => el.closest(".price")')
-                            if price_parent:
-                                parent_text = price_parent.inner_text()
-                                # Skip if this price element is in a "Total" line
-                                if "Total" in parent_text:
-                                    continue
-                            
-                            txt = cc_val.inner_text().strip()
-                            if txt and re.search(r'\$.*[0-9]', txt):
-                                price_text = txt
-                                break
-                        except:
-                            continue
-                
-                # Fallback 1: if price_block not found, try querying from node directly
+                    price_text = price_block.evaluate('''el => {
+                        // Identify the "Total" paragraph so we can exclude its value
+                        const totalPara = Array.from(el.querySelectorAll('p')).find(p => {
+                            const lbl = p.querySelector('.cc_label');
+                            return lbl && lbl.textContent.includes('Total');
+                        });
+                        // Return the first .cc_value NOT contained inside the Total paragraph
+                        for (const cv of el.querySelectorAll('.cc_value')) {
+                            if (totalPara && totalPara.contains(cv)) continue;
+                            const t = cv.textContent.trim();
+                            if (/\\$[\\s]*[0-9]/.test(t)) return t;
+                        }
+                        return null;
+                    }''')
+
+                # Fallback: same JS logic on the full node when price_block is absent
                 if not price_text:
-                    cc_values = node.query_selector_all('.cc_value')
-                    for cc_val in cc_values:
-                        try:
-                            txt = cc_val.inner_text().strip()
-                            # Only take if it looks like a price and appears before any "Total" text
-                            if txt and re.search(r'\$.*[0-9]', txt):
-                                # Check if "Total" appears later in the node
-                                node_text = node.inner_text()
-                                price_pos = node_text.find(txt)
-                                total_pos = node_text.find("Total")
-                                if total_pos == -1 or price_pos < total_pos:
-                                    price_text = txt
-                                    break
-                        except:
-                            continue
-                
-                # Fallback 2: try specific selectors for individual price
-                if not price_text:
-                    price_selectors = [
-                        '.b2b_Your_Price', '.sale_price', '.your_price',
-                        '.b2b_Price', '.price .cc_value'
-                    ]
-                    for sel in price_selectors:
-                        pn = node.query_selector(sel)
-                        if pn:
-                            txt = pn.inner_text().strip()
-                            if txt and re.search(r'[0-9]', txt):
-                                price_text = txt
-                                break
-                
-                # Last resort: search for first $ amount in node text
+                    price_text = node.evaluate('''el => {
+                        const pb = el.querySelector('.price_block') || el;
+                        const totalPara = Array.from(pb.querySelectorAll('p')).find(p => {
+                            const lbl = p.querySelector('.cc_label');
+                            return lbl && lbl.textContent.includes('Total');
+                        });
+                        for (const cv of pb.querySelectorAll('.cc_value')) {
+                            if (totalPara && totalPara.contains(cv)) continue;
+                            const t = cv.textContent.trim();
+                            if (/\\$[\\s]*[0-9]/.test(t)) return t;
+                        }
+                        return null;
+                    }''')
+
+                # Last resort: first $ amount that appears before the word "Total" in raw text
                 if not price_text:
                     node_txt = node.inner_text()
-                    m = re.search(r'\$\s*[0-9,]+(?:\.[0-9]{1,2})?', node_txt)
+                    total_pos = node_txt.find("Total")
+                    search_in = node_txt[:total_pos] if total_pos != -1 else node_txt
+                    m = re.search(r'\$\s*[0-9,]+(?:\.[0-9]{1,2})?', search_in)
                     if m:
                         price_text = m.group(0)
 

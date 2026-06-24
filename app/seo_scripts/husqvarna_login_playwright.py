@@ -300,7 +300,7 @@ def _scrape_cart_page(page: Page, requested_qtys: Dict[str, int], results: List[
             })
             print(
                 f"    ✓ [{base_idx + idx}] {part_number} | "
-                f"Qty: {cart_qty} | Your Price: {your_price} | Kit: {is_kit}"
+                f"Qty: {cart_qty} | Tiered Price: {tiered_price} | Kit: {is_kit}"
             )
 
         except Exception as e:
@@ -441,6 +441,46 @@ def cleanup_cart(page: Page) -> None:
 #  FUNCIÓN PRINCIPAL
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _clear_husqvarna_cart(page: Page) -> None:
+    """
+    Intenta navegar al carrito Husqvarna y eliminar todos los ítems previos.
+    Se llama ANTES del import para evitar contaminación de sesiones anteriores.
+    Usa el enlace de carrito del header; si no lo encuentra, lo intenta
+    directamente por URL. Falla silenciosamente si el carrito no es accesible.
+    """
+    print("🔍 Verificando carrito Husqvarna antes del import...")
+    try:
+        # Intentar enlace de carrito en el header de navegación
+        cart_link = page.locator(
+            'a[href*="/cart"], a[href*="OrderCalculate"], '
+            '[aria-label*="cart" i], [data-testid*="cart"]'
+        )
+        if cart_link.count() > 0 and cart_link.first.is_visible():
+            cart_link.first.click()
+        else:
+            # Fallback: URL directa del carrito Husqvarna Pro
+            page.goto(
+                "https://power.husqvarnagroup.com/cart",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+        try:
+            page.wait_for_selector('#cart-delivery-cart-table', timeout=8000)
+            rows = page.locator(
+                '#cart-delivery-cart-table tbody tr[data-testid^="undefined-row-"]'
+            )
+            if rows.count() > 0:
+                print(f"  ⚠️ Carrito tiene {rows.count()} ítem(s). Limpiando...")
+                cleanup_cart(page)
+                print("  ✅ Carrito Husqvarna limpiado.")
+            else:
+                print("  ✅ Carrito Husqvarna vacío, procediendo.")
+        except Exception:
+            print("  ✅ No se encontró tabla de carrito (probablemente vacío).")
+    except Exception as e:
+        print(f"  ⚠️ Error verificando carrito Husqvarna: {e}")
+
+
 def husqvarna_login_automation_playwright(
     email: str,
     password: str,
@@ -533,6 +573,9 @@ def husqvarna_login_automation_playwright(
             print("⚠️ Login puede no haber sido exitoso.")
         else:
             print(f"✅ Login exitoso. URL: {current_url}")
+
+        # ── 3b. Limpiar carrito antes del import ──────────────────────────────
+        _clear_husqvarna_cart(page)
 
         # ── 4. Navegar a Import Order ────────────────────────────────────────
         print("📥 Navegando a 'Import Order'...")

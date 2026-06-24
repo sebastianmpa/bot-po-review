@@ -19,6 +19,7 @@ from typing import List, Dict, Optional
 
 from models.purchase_model import (
     PurchaseOrderDataModel,
+    PurchaseOrderItemModel,
     PurchaseOrderResponseData,
     PurchaseOrderResponseProduct,
 )
@@ -116,6 +117,168 @@ class SupplierService(ABC):
         return ".csv"
 
     # ------------------------------------------------------------------ #
+    #  Helpers de packs — compartidos por todos los execute()              #
+    # ------------------------------------------------------------------ #
+
+    def _pre_fetch_packs(self, po_data: PurchaseOrderDataModel) -> Dict[tuple, List[Dict]]:
+        """
+        Pre-consulta product_packs en PostgreSQL para todos los productos de la PO.
+        Retorna {(mfrid_upper, pn_upper): [pack_entry_dicts]}.
+        """
+        from seo_scripts.insert_data_in_db import fetch_pack_codes_for_po
+        pack_map = fetch_pack_codes_for_po(po_data.products)
+        total = sum(len(v) for v in pack_map.values())
+        if total:
+            print(f"  📦 Pre-fetch packs: {len(pack_map)} producto(s) con {total} pack(s).")
+        else:
+            print("  📦 Pre-fetch packs: ningún producto tiene packs en BD.")
+        return pack_map
+
+    @staticmethod
+    def _build_pack_lookup_index(
+        pack_map: Dict[tuple, List[Dict]],
+        original_pns_upper: set,
+    ) -> Dict[str, tuple]:
+        """
+        Construye índice inverso: pack_pn_upper → (orig_mfrid_upper, orig_pn_upper).
+        Excluye pack PNs que ya son ítems originales de la PO para evitar colisiones.
+        """
+        index: Dict[str, tuple] = {}
+        for orig_key, packs in pack_map.items():
+            for pack in packs:
+                pack_pn_up = pack['partnumber'].upper()
+                if pack_pn_up not in original_pns_upper:
+                    index[pack_pn_up] = orig_key
+        return index
+
+    @staticmethod
+    def _build_pack_extra_po_items(
+        pack_map: Dict[tuple, List[Dict]],
+        original_pns_upper: set,
+    ) -> List[PurchaseOrderItemModel]:
+        """
+        Crea PurchaseOrderItemModel (qty=1, idealCost=0) para cada PN de pack
+        único que no sea ya un ítem original. Se incluyen en el CSV para que
+        el portal devuelva su precio.
+        """
+        seen: set = set()
+        extra: List[PurchaseOrderItemModel] = []
+        for orig_key, packs in pack_map.items():
+            for pack in packs:
+                pack_pn = pack['partnumber']
+                pack_pn_up = pack_pn.upper()
+                if pack_pn_up in original_pns_upper or pack_pn_up in seen:
+                    continue
+                seen.add(pack_pn_up)
+                extra.append(PurchaseOrderItemModel(
+                    mfrid=pack.get('mfr', orig_key[0]),
+                    partNumber=pack_pn,
+                    qty=1,
+                    idealCost=0.0,
+                ))
+        if extra:
+            print(f"  ➕ {len(extra)} PN(s) de pack añadidos al CSV para consulta de precio.")
+        return extra
+
+    @staticmethod
+    def _build_pack_extra_dict_items(
+        pack_map: Dict[tuple, List[Dict]],
+        original_pns_upper: set,
+    ) -> List[Dict]:
+        """
+        Versión dict de _build_pack_extra_po_items. Usada por proveedores
+        que no usan CSV (Cook's Power, Florida Outdoor).
+        """
+        seen: set = set()
+        extra: List[Dict] = []
+        for orig_key, packs in pack_map.items():
+            for pack in packs:
+                pack_pn = pack['partnumber']
+                pack_pn_up = pack_pn.upper()
+                if pack_pn_up in original_pns_upper or pack_pn_up in seen:
+                    continue
+                seen.add(pack_pn_up)
+                extra.append({
+                    'part_number': pack_pn,
+                    'mfrid':       pack.get('mfr', orig_key[0]),
+                    'qty':         1,
+                    'idealCost':   0.0,
+                    '_pack_lookup': True,
+                })
+        if extra:
+            print(f"  ➕ {len(extra)} PN(s) de pack añadidos a po_items para consulta de precio.")
+        return extra
+
+    @staticmethod
+    def _apply_pack_costs_and_clean(
+        scraped_data: List[Dict],
+        pack_map: Dict[tuple, List[Dict]],
+        pack_lookup_index: Dict[str, tuple],
+    ) -> List[Dict]:
+        """
+        Después de la automatización:
+          1. Identifica en scraped_data los ítems que son consultas de pack
+             (usando pack_lookup_index).
+          2. Extrae su precio y enriquece las entradas de pack_map con 'cost'.
+          3. Adjunta pack_codes (con cost) al ítem original correspondiente.
+          4. Elimina los ítems de pack de scraped_data.
+        Retorna scraped_data limpio (solo ítems originales de la PO).
+        """
+        orig_items_by_pn: Dict[str, Dict] = {}
+        pack_items: List[Dict] = []
+        cleaned: List[Dict] = []
+
+        for item in scraped_data:
+            pn_up = item.get('part_number', '').upper()
+            if pn_up in pack_lookup_index:
+                pack_items.append(item)
+            else:
+                orig_items_by_pn[pn_up] = item
+                cleaned.append(item)
+
+        # 1. Extraer costo de cada pack item scrapeado
+        for pack_item in pack_items:
+            pn_up = pack_item.get('part_number', '').upper()
+            orig_key = pack_lookup_index.get(pn_up)
+            if not orig_key or orig_key not in pack_map:
+                continue
+            cost = float(
+                pack_item.get('your_price') or
+                pack_item.get('tiered_price') or
+                0.0
+            )
+            for entry in pack_map[orig_key]:
+                if entry['partnumber'].upper() == pn_up:
+                    entry['cost'] = cost
+                    print(
+                        f"  💰 Pack cost: {pn_up} = ${cost:.2f} "
+                        f"(para {orig_key[0]}/{orig_key[1]})"
+                    )
+
+        # 2. Marcar cost=None para packs que no aparecieron en el portal
+        for packs in pack_map.values():
+            for entry in packs:
+                if 'cost' not in entry:
+                    entry['cost'] = None
+
+        # 3. Adjuntar pack_codes enriquecido al ítem original en cleaned
+        #    Solo se adjunta al ítem cuyo part_number coincide directamente.
+        #    Los SUPERSEDED no se tocan — su pack_codes queda como None.
+        for orig_key, packs in pack_map.items():
+            orig_pn_up = orig_key[1]
+            item = orig_items_by_pn.get(orig_pn_up)
+            if item:
+                item['pack_codes'] = packs
+                print(f"  📦 pack_codes adjunto a {orig_key[0]}/{orig_pn_up}: {packs}")
+
+        if pack_items:
+            print(
+                f"  ✅ {len(pack_items)} pack item(s) procesados y excluidos "
+                f"del resultado final."
+            )
+        return cleaned
+
+    # ------------------------------------------------------------------ #
     #  Template Method: flujo completo de una PO (no se sobrescribe)       #
     # ------------------------------------------------------------------ #
 
@@ -148,8 +311,15 @@ class SupplierService(ABC):
             ext = self._upload_file_extension
             csv_filename = f"PO_{po_data.poNumber}_{po_data.supplerID}_{timestamp}{ext}"
 
-            # 2. Crear CSV en carpeta temporal
-            csv_path = self._create_csv(po_data.products, csv_filename)
+            # 1.5 Pre-fetch pack codes → construir ítems extra para consulta de precio
+            pack_map = self._pre_fetch_packs(po_data)
+            original_pns_upper = {p.partNumber.upper() for p in po_data.products}
+            pack_lookup_index = self._build_pack_lookup_index(pack_map, original_pns_upper)
+            extra_po_items = self._build_pack_extra_po_items(pack_map, original_pns_upper)
+
+            # 2. Crear CSV en carpeta temporal (incluye PNs de pack para obtener precios)
+            all_products = list(po_data.products) + extra_po_items
+            csv_path = self._create_csv(all_products, csv_filename)
 
             # 3. Copiar a ~/Downloads (donde lo busca el playwright)
             downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -174,31 +344,38 @@ class SupplierService(ABC):
 
             print(f"✅ Automatización completada. {len(scraped_data)} filas extraídas.")
 
-            # 5. Agregar po_number y supplier_code a cada item
-            # Build map part_number -> mfrid_orig from PO products (if provided)
-            try:
-                mfrid_orig_map = {
-                    getattr(p, 'partNumber', ''): getattr(p, 'mfrid_orig', '')
-                    for p in po_data.products
-                }
-            except Exception:
-                mfrid_orig_map = {}
+            # 4.5 Extraer costos de packs y limpiar scraped_data
+            #     (los ítems extra de pack se retiran: no van al chunk ni a la BD)
+            if pack_lookup_index:
+                scraped_data = self._apply_pack_costs_and_clean(
+                    scraped_data, pack_map, pack_lookup_index
+                )
+
+            # 5. Enriquecer items con po_number, supplier_code, mfrid_orig, partnumber_orig
+            # mfrid_orig viene en el body (po_data.products) → crear mapa y asignar a cada item
+            mfrid_orig_map = {
+                p.partNumber: (p.mfrid_orig or '')
+                for p in po_data.products
+            }
 
             for item in scraped_data:
                 item["po_number"] = po_data.poNumber
                 item["supplier_code"] = po_data.supplerID
-                # Propagar mfrid_orig y partnumber_orig desde el body
-                part = item.get('part_number') or item.get('partNumber')
-                if part:
-                    item['mfrid_orig'] = item.get('mfrid_orig', mfrid_orig_map.get(part, ''))
-                    # SUPERSEDED: partnumber_orig = parte original (superseded_from), no el reemplazo
-                    if item.get('status') == 'SUPERSEDED' and item.get('superseded_from'):
-                        item['partnumber_orig'] = item['superseded_from']
-                    else:
-                        item['partnumber_orig'] = item.get('partnumber_orig') or part
+                part = item.get('part_number') or item.get('partNumber') or ''
+
+                # mfrid_orig: leer del body via mapa
+                # Si es SUPERSEDED, buscar por superseded_from (parte original de la PO)
+                if not item.get('mfrid_orig'):
+                    lookup_key = item.get('superseded_from') if item.get('status') == 'SUPERSEDED' else part
+                    item['mfrid_orig'] = mfrid_orig_map.get(lookup_key, '')
+                    if not item['mfrid_orig']:
+                        print(f"  ⚠️  mfrid_orig VACÍO para part='{part}' (status={item.get('status')}) — no vino en el body")
+
+                # partnumber_orig: si es SUPERSEDED, usar superseded_from (parte original)
+                if item.get('status') == 'SUPERSEDED' and item.get('superseded_from'):
+                    item['partnumber_orig'] = item['superseded_from']
                 else:
-                    item['mfrid_orig'] = item.get('mfrid_orig', '')
-                    item['partnumber_orig'] = item.get('partnumber_orig', '')
+                    item['partnumber_orig'] = item.get('partnumber_orig') or part
 
             # 6. Procesar resultados (lógica específica del proveedor)
             response_products = self.process_results(scraped_data, po_data)

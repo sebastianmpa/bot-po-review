@@ -5,7 +5,7 @@ Implementación concreta de SupplierService para Husqvarna (supplerID = "HU").
 
 CSV esperado por Husqvarna: SKU | QUANTITY | COMMENT | DATE
 
-Precio a comparar: your_price (scraped del carrito #cart-delivery-cart-table)
+Precio a comparar: tiered_price (precio unitario del carrito #cart-delivery-cart-table)
 
 Lógica de kit/paquete:
   Si cart_qty > requested_qty → el producto es un kit.
@@ -122,19 +122,19 @@ class HusqvarnaSupplierService(SupplierService):
         po_data: PurchaseOrderDataModel,
     ) -> List[PurchaseOrderResponseProduct]:
         """
-        Compara `your_price` (del carrito) con `idealCost` de la PO.
+        Compara `tiered_price` (precio unitario del carrito) con `idealCost` de la PO.
         Tolerancia: 1 % del ideal_cost.
 
         Campos scrapeados por husqvarna_login_playwright:
           part_number, description, warehouse_qty, est_ship_date,
           qty (carrito), requested_qty, is_kit,
-          tiered_price, your_price,
+          tiered_price (precio unitario), your_price (total = tiered × qty),
           status (CORRECT | PART_ERROR pre-asignado), error_message
 
         Statuses de salida:
           CORRECT    → precio dentro de la tolerancia
           MISMATCH   → precio fuera de la tolerancia
-          PART_ERROR → sin your_price o marcado como error en scraper
+          PART_ERROR → sin tiered_price o marcado como error en scraperer
                        (ej. "not found by cross-referencing")
           KIT        → is_kit=True + precio correcto (nota incluida)
         """
@@ -153,7 +153,7 @@ class HusqvarnaSupplierService(SupplierService):
 
             # Enriquecer mfrid desde el PO — prioridad: PO > scraper
             item["mfrid"] = mfrid_map.get(part_number, item.get("mfrid", ""))
-            your_price: Optional[Decimal] = item.get("your_price")
+            tiered_price: Optional[Decimal] = item.get("tiered_price")
             pre_status: str = item.get("status", "CORRECT")
             error_message: Optional[str] = item.get("error_message")
             pack_qty: Optional[int] = item.get("pack_qty")
@@ -162,7 +162,7 @@ class HusqvarnaSupplierService(SupplierService):
             cart_qty: int = item.get("qty", 0)
 
             ideal_cost = ideal_costs.get(part_number, 0.0)
-            price_float = float(your_price) if your_price is not None else 0.0
+            price_float = float(tiered_price) if tiered_price is not None else 0.0
 
             # ── 1. Statuses pre-asignados por el scraper ──────────────────
             if pre_status == "SUPERSEDED":
@@ -181,7 +181,7 @@ class HusqvarnaSupplierService(SupplierService):
             # ── 2. Sin precio → PART_ERROR ────────────────────────────────────────────────
             elif price_float == 0.0 and ideal_cost > 0:
                 status = "PART_ERROR"
-                error_message = f"No 'your_price' available for {part_number}"
+                error_message = f"No 'tiered_price' available for {part_number}"
                 print(f"  ⚠️ PART_ERROR (sin precio): {part_number}")
 
             # ── 3. Comparación de precios ─────────────────────────────────
@@ -192,7 +192,7 @@ class HusqvarnaSupplierService(SupplierService):
                 pack_note = f" | PACK qty: {pack_qty}" if pack_qty else ""
                 print(
                     f"  💵 [{part_number}] Ideal=${ideal_cost:.2f} | "
-                    f"Your Price=${price_float:.2f} | "
+                    f"Tiered Price=${price_float:.2f} | "
                     f"Diff=${difference:.2f} | Tol=${tolerance:.2f}{pack_note}"
                 )
 
@@ -200,7 +200,7 @@ class HusqvarnaSupplierService(SupplierService):
                     status = "MISMATCH"
                     error_message = (
                         f"Price mismatch: Expected ${ideal_cost:.2f}, "
-                        f"Husqvarna Your Price ${price_float:.2f}"
+                        f"Husqvarna Tiered Price ${price_float:.2f}"
                     )
                     if pack_qty:
                         error_message += f" (Pack item — min qty: {pack_qty})"

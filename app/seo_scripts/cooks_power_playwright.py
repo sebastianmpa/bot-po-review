@@ -129,26 +129,50 @@ def navigate_to_quick_order(page: Page) -> None:
 def recover_from_cms_redirect(page: Page) -> bool:
     """
     Detecta si la página navegó al CMS login de Cook's Power.
-    Si es así, hace clic en el link 'Back' y espera a que vuelva
-    el panel de Quick Order.
+    Si es así:
+      1. Hace clic en 'Back' (a.backlink dentro de div.backcontainer)
+      2. Espera a volver a la home de cookspower.com
+      3. Hace clic en 'Quick Parts Order' (a.quickorder-accesspoints-headerlink-link)
+      4. Espera a que el panel Quick Order esté disponible (#customtypeahead)
 
     :return: True si se detectó y recuperó el redirect, False si no fue necesario.
     """
     if "cms-login" not in page.url and "cms.jsp" not in page.url:
         return False
 
-    print("  ⚠️  Redirigido al CMS login — intentando volver...")
+    print("  ⚠️  Redirigido al CMS login — iniciando recuperación...")
     try:
-        # Clic en el link 'Back'
-        back_link = page.locator("a.backlink")
+        # Paso 1: clic en el link 'Back'
+        back_link = page.locator("div.backcontainer a.backlink, a.backlink")
         if back_link.count() > 0:
             back_link.first.click()
-            print("  ↩️  Clic en 'Back' del CMS login.")
+            print("  ↩️  Clic en '⬅ Back' del CMS login.")
         else:
             page.go_back()
-            print("  ↩️  go_back() ejecutado.")
+            print("  ↩️  go_back() ejecutado (backlink no encontrado).")
 
-        # Esperar a que vuelva el Quick Order
+        # Paso 2: esperar a que la home / carrito de Cook's Power cargue
+        try:
+            page.wait_for_url("**/cookspower.com/**", timeout=TIMEOUT_NAVIGATION)
+        except Exception:
+            pass  # Si ya estamos en cookspower.com, continuar
+        time.sleep(1)
+
+        # Paso 3: hacer clic en 'Quick Parts Order' para reabrir el panel
+        qo_link = page.locator("a.quickorder-accesspoints-headerlink-link")
+        if qo_link.count() > 0:
+            qo_link.first.click()
+            print("  🛒  Clic en 'Quick Parts Order' para reabrir el panel.")
+        else:
+            # Fallback: navegar directo a la URL con el panel abierto
+            print("  ⚠️  Link 'Quick Parts Order' no encontrado — navegando directo al Quick Order...")
+            page.goto(
+                "https://www.cookspower.com/cart?openQuickOrder=true",
+                wait_until="domcontentloaded",
+                timeout=TIMEOUT_NAVIGATION,
+            )
+
+        # Paso 4: esperar a que el input del typeahead esté disponible
         page.wait_for_selector("#customtypeahead", timeout=TIMEOUT_NAVIGATION)
         time.sleep(1)
         print("  ✅ Recuperado — Quick Order disponible.")
@@ -243,60 +267,152 @@ def process_item(
         exact_match = None
         pack_match = None
         pack_match_sku = None
+        nla_option = None  # opción con NLA (fallback si no hay exacta)
 
         for opt in options:
             item_name, sku = _get_option_info(opt)
             print(f"     → name='{item_name}'  sku='{sku}'")
             result["typeahead_label"] = item_name  # guarda la primera / última vista
 
-            # ── NLA ─────────────────────────────────────────────────────────
+            # ── PRIMERO: verificar coincidencia exacta de SKU (sin NLA) ───────
+            # Si escribiste "606967", seleccionar la opción con sku='606967'
+            # aunque haya otra opción SUPERSEDED que apunte a 606967.
+            # NO aplicar SUPERSEDED si la coincidencia exacta existe.
+            if sku.upper() == part_number.upper():
+                # Chequear si esta opción (exacta) tiene NLA
+                has_nla = re.search(r"\bNLA\b|NO LONGER AVAIL", item_name, re.IGNORECASE)
+                if not has_nla:
+                    # Coincidencia exacta SIN NLA — usar directamente
+                    exact_match = opt
+                    print(f"  ✅ Coincidencia exacta (sin NLA): {sku}")
+                    # Salir del loop inmediatamente — encontramos lo que buscábamos
+                    break
+                else:
+                    # Coincidencia exacta pero CON NLA — guardar para luego
+                    nla_option = opt
+                    print(f"  ⚠️  Coincidencia exacta con NLA: {sku}")
+                    continue
+
+            # ── NLA (solo si NO hay coincidencia exacta) ─────────────────────
             # El label puede contener "NLA", "*** NLA ***", "NO LONGER AVAIL", etc.
+            # Pero NO aplicar NLA si hay una coincidencia exacta del SKU escrito.
             if re.search(r"\bNLA\b|NO LONGER AVAIL", item_name, re.IGNORECASE):
-                print(f"  ❌ NLA detectado: {part_number} — limpiando input y continuando.")
-                result["status"] = "PART_ERROR"
-                result["nla"] = "Y"
-                result["error_message"] = f"Part {part_number} is NLA (No Longer Available)"
-                # Cerrar dropdown y NO hacer clic en Add Item.
-                # IMPORTANTE: el Escape puede disparar la redirección al CMS login;
-                # recuperamos primero y luego retornamos sin tocar el input.
+                if not nla_option:
+                    nla_option = opt
+                print(f"  ℹ️  NLA encontrado (fallback si no hay exacta): {sku}")
+                continue
+
+            # ── SUPERSEDED (USE / SP TO / S/X TO) ───────────────────────────
+            # Cuando el typeahead muestra "USE XXXXX" o "SP TO XXXXX":
+            #
+            # CASO A — el SKU de reemplazo ya está en la opción actual (sku != ""):
+            #   · Clic directo en opt — sin Escape, sin re-búsqueda.
+            #   · El Escape dispara redirección al CMS login, por eso se evita.
+            #
+            # CASO B — el SKU está vacío (raro):
+            #   · Se intenta primero encontrar la parte en las otras opciones
+            #     del dropdown ya visible (sin Escape).
+            #   · Si no se encuentra, se escapa y re-busca (con recovery CMS).
+            sup_match = re.match(
+                r"^(?:USE|SP\s+TO|S/[A-Z]\s+TO)\s+(\S+)",
+                item_name,
+                re.IGNORECASE,
+            )
+            if sup_match:
+                replacement_candidate = sup_match.group(1).strip()
+                # Si el dropdown tiene un SKU propio, usarlo como reemplazo
+                replacement_sku_to_find = sku if sku else replacement_candidate
+                print(
+                    f"  🔄 SUPERSEDED detectado: {part_number} → {replacement_sku_to_find}"
+                )
+
+                if sku:
+                    # CASO A: la opción actual ya ES el reemplazo — clic directo
+                    selected_option = opt
+                    selected_sku = sku
+                    result["status"] = "SUPERSEDED"
+                    result["superseded_from"] = part_number  # parte original PO
+                    result["part_number"] = sku              # nueva parte
+                    print(f"  ✅ Reemplazo seleccionado directamente: {sku}")
+                    break
+
+                # CASO B: sku vacío — buscar en las demás opciones del dropdown actual
+                replacement_found = False
+                for r_opt in options:
+                    r_name, r_sku = _get_option_info(r_opt)
+                    if r_sku.upper() == replacement_sku_to_find.upper():
+                        selected_option = r_opt
+                        selected_sku = r_sku
+                        result["status"] = "SUPERSEDED"
+                        result["superseded_from"] = part_number
+                        result["part_number"] = r_sku
+                        replacement_found = True
+                        print(f"  ✅ Reemplazo encontrado en dropdown: {r_sku}")
+                        break
+
+                if replacement_found:
+                    break
+
+                # Último recurso: Escape + nueva búsqueda (puede disparar CMS redirect)
+                print(
+                    f"  ⚠️  '{replacement_sku_to_find}' no en dropdown actual "
+                    f"→ re-buscando..."
+                )
                 try:
                     typeahead_input.press("Escape")
                     time.sleep(0.5)
+                    recover_from_cms_redirect(page)
                 except Exception:
-                    pass  # Si ya navegó, ignorar el error del Escape
-                # Recuperar si el Escape causó redirect al CMS
-                recover_from_cms_redirect(page)
-                return result  # ← saltar Add Item y pasar al siguiente ítem
+                    pass
 
-            # ── SUPERSEDED ───────────────────────────────────────────────────
-            # Patrones en el nombre:
-            #   "S/C TO 607317"  → este ítem (SKU=789537) reemplaza a 607317
-            #   "USE 768515"     → usar 768515 en lugar del buscado
-            #   "S/P TO 607317"  → similar
-            # El SKU de la opción es el part nuevo; el número en el nombre es el original.
-            sup_match = re.match(r"^(?:USE|S/[A-Z]\s+TO)\s+(\S+)", item_name, re.IGNORECASE)
-            if sup_match:
-                # El texto del nombre referencia la parte ORIGINAL buscada.
-                # El SKU de esta opción del dropdown es el reemplazo real.
-                original_part = sup_match.group(1).strip()  # ej: "607317"
-                replacement_sku = sku if sku else original_part  # ej: "789537"
-                # superseded_from: preferir la parte extraída del nombre
-                # ya que puede diferir ligeramente del part_number buscado
-                superseded_from_part = original_part if original_part else part_number
-                print(f"  🔄 SUPERSEDED: {superseded_from_part} → {replacement_sku}")
-                result["status"] = "SUPERSEDED"
-                result["superseded_from"] = superseded_from_part
-                result["part_number"] = replacement_sku
-                selected_option = opt
-                selected_sku = replacement_sku
-                break
+                typeahead_input.click(click_count=3)
+                typeahead_input.fill("")
+                time.sleep(0.3)
+                typeahead_input.type(replacement_sku_to_find, delay=80)
 
-            # ── Coincidencia exacta de SKU ───────────────────────────────────
-            if sku.upper() == part_number.upper():
-                exact_match = opt
+                try:
+                    page.wait_for_selector(
+                        "div.typeahead-option[data-action='select-item']",
+                        timeout=TIMEOUT_TYPEAHEAD,
+                    )
+                    r_opts = page.locator(
+                        "div.typeahead-option[data-action='select-item']"
+                    ).all()
+                    for r_opt in r_opts:
+                        r_name, r_sku = _get_option_info(r_opt)
+                        if r_sku.upper() == replacement_sku_to_find.upper():
+                            selected_option = r_opt
+                            selected_sku = r_sku
+                            result["status"] = "SUPERSEDED"
+                            result["superseded_from"] = part_number
+                            result["part_number"] = r_sku
+                            replacement_found = True
+                            print(f"  ✅ Reemplazo encontrado (re-búsqueda): {r_sku}")
+                            break
+                except PlaywrightTimeoutError:
+                    print(
+                        f"  ⚠️  Timeout buscando reemplazo '{replacement_sku_to_find}'"
+                    )
+
+                if not replacement_found:
+                    print(
+                        f"  ⚠️  Reemplazo '{replacement_sku_to_find}' no encontrado "
+                        f"→ SUPERSEDED sin reemplazar"
+                    )
+                    result["status"] = "SUPERSEDED"
+                    try:
+                        typeahead_input.press("Escape")
+                        time.sleep(0.3)
+                        recover_from_cms_redirect(page)
+                        typeahead_input.fill("")
+                    except Exception:
+                        pass
+                    return result
+
+                break  # Salir del loop; selected_option apunta al reemplazo
 
             # ── Versión PACK (sufijo "X") ────────────────────────────────────
-            elif (sku.upper() == part_number.upper() + "X" or
+            if (sku.upper() == part_number.upper() + "X" or
                   (sku.upper().startswith(part_number.upper()) and sku.upper().endswith("X"))):
                 pack_match = opt
                 pack_match_sku = sku
@@ -311,6 +427,19 @@ def process_item(
                 _, selected_sku = _get_option_info(exact_match)
                 if pack_match:
                     print(f"  📦 Versión pack disponible como alternativa (pack_qty={result['pack_qty']})")
+            elif nla_option:
+                # Coincidencia exacta pero tiene NLA
+                print(f"  ❌ NLA detectado: {part_number} — limpiando input y continuando.")
+                result["status"] = "PART_ERROR"
+                result["nla"] = "Y"
+                result["error_message"] = f"Part {part_number} is NLA (No Longer Available)"
+                try:
+                    typeahead_input.press("Escape")
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+                recover_from_cms_redirect(page)
+                return result
             elif pack_match:
                 # Solo existe versión pack
                 selected_option = pack_match
@@ -691,6 +820,12 @@ def cooks_power_automation_playwright(
             # ── Navegar al Quick Order ──────────────────────────────────────
             navigate_to_quick_order(page)
 
+            # ── Limpiar carrito antes de procesar ítems ──────────────────────
+            # Elimina ítems residuales de sesiones anteriores para garantizar
+            # que el carrito está vacío antes de empezar a cargar la nueva PO.
+            print("🗑️ Verificando carrito Cook's Power antes de iniciar...")
+            clear_cart(page)
+
             # ── Procesar cada ítem: añadir → capturar precio → verificar stock → eliminar ──
             CART_QO_URL = "https://www.cookspower.com/cart?openQuickOrder=true"
             typeahead_results: Dict[str, Dict] = {}
@@ -761,6 +896,7 @@ def cooks_power_automation_playwright(
             for item in po_items:
                 original_pn = item.get("part_number", "")
                 mfrid = item.get("mfrid", "")
+                mfrid_orig = item.get("mfrid_orig", "")  # ✅ Viene directamente del body
                 requested_qty = item.get("qty", 1)
                 ideal_cost = item.get("idealCost", 0.0)
 
@@ -799,7 +935,8 @@ def cooks_power_automation_playwright(
                 elif out_of_stock:
                     final_status = "PART_ERROR"
                     error_message = f"{oos_message or 'Out of Stock'}: {effective_pn}"
-                    nla = "Y"
+                    # ✅ OOS NO es NLA — son cosas distintas
+                    # nla queda como None (lo que ya viene del typeahead)
                     qty_available, in_stock = 0, 'N'
                 else:
                     final_status = "CORRECT"  # Se refinará en process_results
@@ -809,6 +946,7 @@ def cooks_power_automation_playwright(
                     "part_number": effective_pn,
                     "requested_sku": original_pn,
                     "mfrid": mfrid,
+                    "mfrid_orig": mfrid_orig,  # ✅ Propagado directamente del body
                     "qty": cart_qty,
                     "qty_available": qty_available,
                     "in_stock": in_stock,
@@ -889,7 +1027,7 @@ if __name__ == "__main__":
             "idealCost": 0.0,
         },
          {
-            "part_number": "055939",
+            "part_number": "068478",
             "qty": 1,
             "mfrid": "CP",
             "idealCost": 0.0,

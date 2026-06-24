@@ -325,6 +325,7 @@ def _scrape_cart_with_details(
     requested_qtys: Dict[str, int],
     out_of_stock: Dict[str, str],
     po_mfr_map: Dict[str, str],
+    po_mfr_orig_map: Dict[str, str],
 ) -> List[Dict]:
     """
     Scrapea TODAS las páginas de table.standardTable.
@@ -407,6 +408,7 @@ def _scrape_cart_with_details(
 
             all_results.append({
                 'mfrid': po_mfr_map.get(part_number, ''),  # ✅ DEL BODY
+                'mfrid_orig': po_mfr_orig_map.get(part_number, ''),  # ✅ DEL BODY
                 'part_number': part_number,
                 'description': item_data['description'],
                 'qty': cart_qty,
@@ -461,9 +463,13 @@ def florida_outdoor_automation_playwright(
         for item in po_items if item.get('part_number')
     }
 
-    # ✅ Crear mapa mfrid desde el body para enriquecimiento
+    # ✅ Crear mapas desde el body para enriquecimiento
     po_mfr_map: Dict[str, str] = {
         item.get('part_number', ''): item.get('mfrid', '')
+        for item in po_items if item.get('part_number')
+    }
+    po_mfr_orig_map: Dict[str, str] = {
+        item.get('part_number', ''): item.get('mfrid_orig', '')
         for item in po_items if item.get('part_number')
     }
 
@@ -509,6 +515,24 @@ def florida_outdoor_automation_playwright(
         time.sleep(3)
         print("✅ Order Pad cargado.")
 
+        # ── 2b. Limpiar carrito antes de añadir ítems ────────────────────────
+        # Navega al carrito, elimina ítems residuales de sesiones anteriores
+        # y vuelve al Order Pad para empezar con carrito vacío.
+        print("🗑️ Verificando carrito FOE antes de añadir ítems...")
+        page.goto(
+            "https://ecommerce.floridaoutdoor.com/storefrontCommerce/cartView.do",
+            wait_until="domcontentloaded",
+        )
+        time.sleep(2)
+        _clear_foe_cart(page)
+        print("📋 Volviendo al Order Pad...")
+        page.goto(
+            "https://ecommerce.floridaoutdoor.com/storefrontCommerce/orderpad.do",
+            wait_until="domcontentloaded",
+        )
+        time.sleep(3)
+        print("✅ Order Pad listo para carga.")
+
         # ── 3. Añadir ítems uno a uno ─────────────────────────────────────────
         print("🗂️ Añadiendo ítems al carrito...")
         invalid_items: Dict[str, str] = {}
@@ -550,7 +574,7 @@ def florida_outdoor_automation_playwright(
         cart_items: List[Dict] = []
         if page.locator('table.standardTable').count() > 0:
             print("📊 Scrapeando carrito con detalles de stock...")
-            cart_items = _scrape_cart_with_details(page, requested_qtys, out_of_stock, po_mfr_map)
+            cart_items = _scrape_cart_with_details(page, requested_qtys, out_of_stock, po_mfr_map, po_mfr_orig_map)
             print(f"✅ {len(cart_items)} ítem(s) procesados del carrito.")
         else:
             print("⚠️ No se encontró table.standardTable.")
@@ -566,6 +590,7 @@ def florida_outdoor_automation_playwright(
                 # ✅ ASEGURAR que el error capturado se preserva en la estructura final
                 cart_items.append({
                     'mfrid': po_mfr_map.get(part, ''),  # ✅ DEL BODY
+                    'mfrid_orig': po_mfr_orig_map.get(part, ''),  # ✅ DEL BODY
                     'part_number': part,
                     'description': '',
                     'qty': requested_qtys.get(part, 0),

@@ -92,14 +92,20 @@ class BriggsSupplierService(SupplierService):
         **kwargs,
     ) -> Optional[List[Dict]]:
         requested_qtys: Dict[str, int] = {}
+        po_items_list: List[Dict] = []
         if po_data is not None:
             requested_qtys = {p.partNumber: p.qty for p in po_data.products}
+            po_items_list = [
+                {'mfrid': p.mfrid, 'part_number': p.partNumber, 'qty': p.qty}
+                for p in po_data.products
+            ]
 
         return briggs_login_automation_playwright(
             username=email,
             password=password,
             csv_filename=csv_filename,
             requested_qtys=requested_qtys,
+            po_items=po_items_list,
         )
 
     # ------------------------------------------------------------------ #
@@ -121,6 +127,10 @@ class BriggsSupplierService(SupplierService):
           PART_ERROR → NLA / not available
           SUPERSEDED → parte reemplazada
         """
+        # Lookups de idealCost: primero por (mfrid, partNumber), fallback por partNumber solo
+        ideal_costs_keyed: Dict[tuple, float] = {
+            (p.mfrid, p.partNumber): p.idealCost for p in po_data.products
+        }
         ideal_costs: Dict[str, float] = {
             p.partNumber: p.idealCost for p in po_data.products
         }
@@ -142,7 +152,14 @@ class BriggsSupplierService(SupplierService):
             superseded_from: Optional[str] = item.get("superseded_from")
             cart_qty: int = item.get("qty", 0)
 
-            ideal_cost = ideal_costs.get(part_number, 0.0)
+            # Lookup de idealCost: primero por (mfrid_item, partNumber), luego solo por partNumber
+            item_mfrid_for_lookup = item.get('mfrid', '') or ''
+            ideal_cost = (
+                ideal_costs_keyed.get((item_mfrid_for_lookup, part_number))
+                if item_mfrid_for_lookup else None
+            )
+            if ideal_cost is None:
+                ideal_cost = ideal_costs.get(part_number, 0.0)
 
             # Si es SUPERSEDED, buscar ideal_cost por el part original (superseded_from)
             if ideal_cost == 0.0 and superseded_from:
@@ -160,9 +177,13 @@ class BriggsSupplierService(SupplierService):
             item["ideal_cost"] = ideal_cost
 
             # ── Enriquecer mfrid desde la PO original ─────────────────────
-            # El scraper siempre devuelve mfrid='' (el portal Briggs no lo expone).
-            # Prioridad: PO mfrid_map → superseded_from → fallback 'BRS'
-            resolved_mfrid = mfrid_map.get(part_number, '')
+            # Prioridad: 1) mfrid ya fijado en el ítem (p.ej. desde _parse_invalid_parts)
+            #            2) mfrid_map de la PO (por partNumber)
+            #            3) superseded_from lookup
+            #            4) fallback 'BRS'
+            resolved_mfrid = item.get('mfrid', '') or ''
+            if not resolved_mfrid:
+                resolved_mfrid = mfrid_map.get(part_number, '')
             if not resolved_mfrid and superseded_from:
                 sf_parts = superseded_from.split()
                 for key in [superseded_from] + ([sf_parts[-1]] if len(sf_parts) >= 2 else []):
@@ -205,7 +226,10 @@ class BriggsSupplierService(SupplierService):
                     f"{ltl_note}{pack_note}"
                 )
 
-                if difference > tolerance:
+                # Solo es MISMATCH si el precio del proveedor es MÁS ALTO que
+                # el ideal. Si es igual o más bajo (below cost = buena oferta)
+                # se marca como CORRECT.
+                if price_float > ideal_cost and difference > tolerance:
                     status = "MISMATCH"
                     error_message = (
                         f"Price mismatch: Expected ${ideal_cost:.2f}, "

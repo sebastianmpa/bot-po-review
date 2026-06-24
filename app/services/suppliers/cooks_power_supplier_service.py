@@ -12,7 +12,9 @@ Diferencias clave respecto a los otros proveedores:
 
 Detección de estados durante el typeahead:
   NLA        → "*** NLA ***" en el label → status=PART_ERROR, nla='Y'
-  SUPERSEDED → "USE <new_sku>" en el label → status=SUPERSEDED, superseded_from=<original>
+  SUPERSEDED → Números diferentes (ej: "USE 768515" cuando se buscó 604944) → status=SUPERSEDED
+             → NO es SUPERSEDED si solo cambia el sufijo (ej: "USE 604944P" buscando 604944)
+  VARIANTE   → Mismo número + sufijo (ej: 604944 → 604944P) → se trata como CORRECT/MISMATCH
   PACK       → versión con sufijo "X" disponible → pack_qty registrado
   OUT_OF_STOCK → indicador en el carrito → status=PART_ERROR, nla='Y'
 """
@@ -91,16 +93,23 @@ class CooksPowerSupplierService(SupplierService):
         try:
             credentials = self.get_credentials()
 
+            # Pre-fetch pack codes antes de la automatización
+            pack_map = self._pre_fetch_packs(po_data)
+            original_pns_upper = {p.partNumber.upper() for p in po_data.products}
+            pack_lookup_index = self._build_pack_lookup_index(pack_map, original_pns_upper)
+            extra_dict_items = self._build_pack_extra_dict_items(pack_map, original_pns_upper)
+
             # Convertir productos de la PO al formato que espera run_automation()
             po_items = [
                 {
                     "part_number": p.partNumber,
                     "qty": p.qty,
                     "mfrid": p.mfrid,
+                    "mfrid_orig": p.mfrid_orig,  # ✅ AGREGAR mfrid_orig del request
                     "idealCost": p.idealCost,
                 }
                 for p in po_data.products
-            ]
+            ] + extra_dict_items
 
             print(f"🤖 Ejecutando automatización [{self.supplier_name}]...")
             scraped_data = self.run_automation(
@@ -119,14 +128,33 @@ class CooksPowerSupplierService(SupplierService):
 
             print(f"✅ Automatización completada. {len(scraped_data)} filas extraídas.")
 
-            # Agregar po_number, supplier_code, mfrid_orig y partnumber_orig a cada item
-            mfrid_orig_map = {p.partNumber: p.mfrid_orig for p in po_data.products}
+            # Extraer costos de packs y limpiar scraped_data
+            if pack_lookup_index:
+                scraped_data = self._apply_pack_costs_and_clean(
+                    scraped_data, pack_map, pack_lookup_index
+                )
+
+            # Enriquecer items: agregar po_number, supplier_code, mfrid_orig, partnumber_orig
+            # mfrid_orig viene en el body (po_data.products) → crear mapa y asignar a cada item
+            mfrid_orig_map = {
+                p.partNumber: (p.mfrid_orig or '')
+                for p in po_data.products
+            }
+
             for item in scraped_data:
                 item["po_number"] = po_data.poNumber
                 item["supplier_code"] = po_data.supplerID
                 part = item.get("part_number", "")
-                item["mfrid_orig"] = item.get("mfrid_orig") or mfrid_orig_map.get(part, "")
-                # SUPERSEDED: partnumber_orig = parte original (superseded_from), no el reemplazo
+
+                # mfrid_orig: leer del body via mapa
+                # Si es SUPERSEDED, buscar por superseded_from (parte original de la PO)
+                if not item.get("mfrid_orig"):
+                    lookup_key = item.get("superseded_from") if item.get("status") == "SUPERSEDED" else part
+                    item["mfrid_orig"] = mfrid_orig_map.get(lookup_key, "")
+                    if not item["mfrid_orig"]:
+                        print(f"  ⚠️  mfrid_orig VACÍO para part='{part}' (status={item.get('status')}) — no vino en el body")
+
+                # partnumber_orig: si es SUPERSEDED, usar superseded_from (parte original)
                 if item.get("status") == "SUPERSEDED" and item.get("superseded_from"):
                     item["partnumber_orig"] = item["superseded_from"]
                 else:
@@ -171,6 +199,7 @@ class CooksPowerSupplierService(SupplierService):
                     "part_number": p.partNumber,
                     "qty": p.qty,
                     "mfrid": p.mfrid,
+                    "mfrid_orig": p.mfrid_orig,  # ✅ AGREGAR mfrid_orig
                     "idealCost": p.idealCost,
                 }
                 for p in po_data.products

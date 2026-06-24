@@ -22,12 +22,10 @@ def parse_price(price_text: str) -> Optional[Decimal]:
 def extract_table_data(page: Page) -> List[Dict]:
     """
     Extrae todos los datos de la tabla Quick Order después de cargar el CSV.
-    Deduplica por part_number: si múltiples filas tienen el mismo part_number limpio (después de quitar MFRID),
-    mantiene solo la primera ocurrencia para evitar búsquedas duplicadas en Gardner.
+    ✅ Procesa TODOS los items, incluidos duplicados (sin deduplicación).
+    fix_concatenated_part_numbers() debe haber limpiado los MFRID concatenados ANTES.
     """
     results = []
-    seen_parts: set = set()  # Rastrear part_numbers ya agregados
-    duplicates_removed = 0
     
     try:
         # Esperar a que la tabla esté presente
@@ -163,13 +161,8 @@ def extract_table_data(page: Page) -> List[Dict]:
                 
                 # Solo agregar filas que tienen part_number
                 if part_number:
-                    # Deduplicación: si ya hemos visto este part_number, omitir
-                    if part_number in seen_parts:
-                        print(f"  ⏭️  Duplicado omitido: {part_number} (ya procesado)")
-                        duplicates_removed += 1
-                        continue
-                    
-                    seen_parts.add(part_number)
+                    # ✅ Procesar TODOS los items, sin deduplicación
+                    # (aunque sean duplicados, los incluimos todos)
                     
                     row_data = {
                         'mfrid': mfr_value,
@@ -194,7 +187,7 @@ def extract_table_data(page: Page) -> List[Dict]:
                 print(f"  ⚠️ Error procesando fila {idx}: {e}")
                 continue
         
-        print(f"📦 Total después de deduplicación: {len(results)} items (duplicados eliminados: {duplicates_removed})")
+        print(f"📦 Total items extraídos: {len(results)} (incluidos duplicados, sin deduplicación)")
         return results
         
     except Exception as e:
@@ -268,68 +261,102 @@ def fix_concatenated_part_numbers(page: Page) -> int:
     Para cada fila con error:
     1. Quita SIEMPRE las primeras 3 letras (sin importar si hay duplicados)
     2. Edita el input en Gardner
-    3. Pasa el mouse a la fila de abajo
+    3. Pasa el mouse a la siguiente fila de la tabla completa
+    4. Continúa hasta la última fila, sin importar si aparecen duplicados
     
     Una vez termina CON TODAS, hace el scraper de nuevo con todos los items.
     Si queda part_error, se queda así.
     """
     fixed = 0
+    processed_rows = set()  # Para evitar procesar la MISMA fila dos veces
+    max_iterations = 100    # Prevenir loop infinito
+    iteration = 0
     
     try:
-        # Buscar todas las filas con clase 'q-table-row--error'
-        error_rows = page.locator('li.q-table-row--error').all()
-        if not error_rows:
-            print("ℹ️ No hay filas con error para corregir.")
-            return 0
+        print("🔧 Buscando filas con error para quitar MFRID concatenado...")
         
-        print(f"🔧 Quitando MFRID en {len(error_rows)} fila(s) con error...")
+        # Obtener la lista COMPLETA de filas una sola vez
+        all_rows = page.locator('.q-table-row').all()
+        print(f"📋 Total de filas en la tabla: {len(all_rows)}")
         
-        for idx, row in enumerate(error_rows):
-            try:
-                # Encontrar el input de part_number en esta fila (col-2)
-                pn_input = row.locator('.q-col-2 input').first
-                if not pn_input or pn_input.count() == 0:
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # ✅ BUSCAR FILAS CON ERROR EN CADA ITERACIÓN
+            error_rows = page.locator('li.q-table-row--error').all()
+            if not error_rows:
+                break  # No más filas con error
+            
+            found_unprocessed = False
+            
+            for error_idx, error_row in enumerate(error_rows):
+                row_id = id(error_row)  # Identificador único de esta fila
+                if row_id in processed_rows:
+                    continue  # Ya procesada
+                
+                try:
+                    # Encontrar el input de part_number en esta fila (col-2)
+                    pn_input = error_row.locator('.q-col-2 input').first
+                    if not pn_input or pn_input.count() == 0:
+                        processed_rows.add(row_id)
+                        continue
+                    
+                    current_value = (pn_input.get_attribute('value') or '').strip()
+                    if not current_value or len(current_value) <= 3:
+                        processed_rows.add(row_id)
+                        continue
+                    
+                    # Quitar las primeras 3 letras (MFRID concatenado) - SIN IMPORTAR DUPLICADOS
+                    first_three = current_value[:3]
+                    if not first_three.isalpha():
+                        processed_rows.add(row_id)
+                        continue
+                    
+                    clean_part = current_value[3:]
+                    
+                    # Editar el input: quitar las 3 letras del MFRID
+                    print(f"  🔧 Fila con error {error_idx}: '{current_value}' → '{clean_part}'")
+                    pn_input.click()                           # Click en el input
+                    pn_input.fill('')                          # Limpiar primero
+                    pn_input.type(clean_part, delay=50)        # Escribir carácter por carácter
+                    time.sleep(0.5)                            # Esperar a que se escriba
+                    
+                    # Verificar que el valor se actualizó correctamente
+                    updated_value = pn_input.get_attribute('value') or ''
+                    print(f"    ✓ Input actualizado: '{updated_value}'")
+                    
+                    # Disparar cambio: Enter para activar búsqueda en Gardner
+                    pn_input.press('Enter')
+                    time.sleep(1.5)  # Esperar búsqueda en Gardner
+                    
+                    fixed += 1
+                    processed_rows.add(row_id)
+                    found_unprocessed = True
+                    
+                    # ✅ PASAR EL MOUSE A LA SIGUIENTE FILA (de la tabla completa)
+                    # Primero, encontrar el índice de la fila actual en la tabla completa
+                    try:
+                        current_row_index = all_rows.index(error_row) if error_row in all_rows else -1
+                        if current_row_index >= 0 and current_row_index + 1 < len(all_rows):
+                            next_row = all_rows[current_row_index + 1]
+                            next_row.hover()
+                            print(f"    ➡️ Mouse pasado a fila {current_row_index + 1} (siguiente en tabla)")
+                            time.sleep(0.5)
+                    except Exception as hover_error:
+                        # Si no podemos pasar el mouse por índice, intentar con el siguiente error_row
+                        if error_idx + 1 < len(error_rows):
+                            next_error_row = error_rows[error_idx + 1]
+                            next_error_row.hover()
+                            print(f"    ➡️ Mouse pasado a siguiente fila con error")
+                            time.sleep(0.5)
+                    
+                except Exception as e:
+                    print(f"  ⚠️ Error en fila con error {error_idx}: {e}")
+                    processed_rows.add(row_id)
                     continue
-                
-                current_value = (pn_input.get_attribute('value') or '').strip()
-                if not current_value or len(current_value) <= 3:
-                    continue
-                
-                # Quitar las primeras 3 letras (MFRID concatenado) - SIN IMPORTAR DUPLICADOS
-                first_three = current_value[:3]
-                if not first_three.isalpha():
-                    # Las primeras 3 no son letras, probablemente no es MFRID
-                    continue
-                
-                clean_part = current_value[3:]
-                
-                # Editar el input: quitar las 3 letras del MFRID
-                print(f"  🔧 Fila {idx}: '{current_value}' → '{clean_part}'")
-                pn_input.click()                           # Click en el input
-                pn_input.fill('')                          # Limpiar primero
-                pn_input.type(clean_part, delay=50)        # Escribir carácter por carácter
-                time.sleep(0.5)                            # Esperar a que se escriba
-                
-                # Verificar que el valor se actualizó correctamente
-                updated_value = pn_input.get_attribute('value') or ''
-                print(f"    ✓ Input actualizado: '{updated_value}'")
-                
-                # Disparar cambio: Enter para activar búsqueda en Gardner
-                pn_input.press('Enter')
-                time.sleep(1.5)  # Esperar búsqueda en Gardner
-                
-                fixed += 1
-                
-                # ✅ PASAR EL MOUSE A LA FILA DE ABAJO
-                if idx + 1 < len(error_rows):
-                    next_row = error_rows[idx + 1]
-                    next_row.hover()
-                    print(f"    ➡️ Mouse pasado a fila {idx + 1}")
-                    time.sleep(0.5)
-                
-            except Exception as e:
-                print(f"  ⚠️ Error en fila {idx}: {e}")
-                continue
+            
+            if not found_unprocessed:
+                break  # Todas las filas ya fueron procesadas
         
         # ✅ UNA VEZ TERMINA CON TODAS, HACER EL SCRAPER DE NUEVO
         if fixed:
@@ -337,6 +364,8 @@ def fix_concatenated_part_numbers(page: Page) -> int:
             time.sleep(4)  # Esperar final a que Gardner actualice todo
             
             print(f"\n🔄 Haciendo el scraper de nuevo con todos los items...")
+        else:
+            print("ℹ️ No había filas con error para corregir.")
         
     except Exception as e:
         print(f"❌ Error en fix_concatenated_part_numbers: {e}")

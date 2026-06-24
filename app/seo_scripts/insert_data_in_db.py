@@ -133,6 +133,64 @@ def lookup_crossovers_and_packs(mfrid: str, part_number: str) -> Dict:
     return result
 
 
+def fetch_pack_codes_for_po(po_products) -> Dict[tuple, List[Dict]]:
+    """
+    Pre-consulta product_packs en PostgreSQL para TODOS los productos de la PO
+    ANTES de ejecutar la automatización, de forma que los PN de packs puedan
+    incluirse en el CSV/automation para obtener sus costos del portal.
+
+    Retorna {(mfrid_upper, pn_upper): [pack_entry_dicts]}.
+    Cada pack_entry_dict tiene las claves: mfr, partnumber, pack_qty, notes.
+    El campo 'cost' se añade después de la automatización por _apply_pack_costs_and_clean.
+    """
+    pack_map: Dict[tuple, List[Dict]] = {}
+    try:
+        conn = get_pg_connection()
+        cur = conn.cursor()
+        for p in po_products:
+            # Soporta tanto PurchaseOrderItemModel como dict
+            if isinstance(p, dict):
+                mfrid = (p.get('mfrid') or '').strip()
+                pn = (p.get('partNumber') or p.get('part_number') or '').strip()
+            else:
+                mfrid = (getattr(p, 'mfrid', '') or '').strip()
+                pn = (getattr(p, 'partNumber', '') or '').strip()
+            if not pn:
+                continue
+            key = (mfrid.upper(), pn.upper())
+            try:
+                cur.execute(
+                    """
+                    SELECT mfr_pack, partnumber_pack, pack_qty, notes
+                    FROM product_packs
+                    WHERE mfr = %s AND partnumber = %s
+                    """,
+                    (mfrid, pn),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    pack_map[key] = [
+                        {
+                            'mfr':        r[0],
+                            'partnumber': r[1],
+                            'pack_qty':   r[2],
+                            'notes':      r[3] or '',
+                        }
+                        for r in rows
+                    ]
+                    logger.info(
+                        f"📦 Pre-fetch packs: {mfrid}/{pn} → "
+                        f"{len(rows)} pack(s) encontrados."
+                    )
+            except Exception as _e:
+                logger.warning(f"⚠️ Pack pre-fetch fail {mfrid}/{pn}: {_e}")
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"⚠️ fetch_pack_codes_for_po falló: {e}")
+    return pack_map
+
+
 def insert_po_review_details(scraped_data: List[Dict]) -> int:
     """
     Inserta los datos de scraping en la tabla po_review_details.
@@ -202,8 +260,19 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
                             mfrid_lookup = db_data['mfrid']
                             logger.info(f"  🏷️  MFRID resuelto desde ERP: '{mfrid_lookup}' para '{part_number_lookup}'")
 
-                    # PostgreSQL: crossovers y packs (usa mfrid del ERP si el item no lo trae)
-                    if mfrid_lookup:
+                    # PostgreSQL: crossovers (siempre) + packs
+                    # Si pack_codes ya fue pre-fetched y enriquecido con 'cost' antes
+                    # de la automatización, usar esos directamente. Si no, consultar BD.
+                    if item.get('pack_codes') is not None:
+                        pack_codes_json = json.dumps(item['pack_codes'])
+                        # Crossovers se consultan siempre independientemente
+                        if mfrid_lookup:
+                            cp_data = lookup_crossovers_and_packs(
+                                mfrid_lookup, part_number_lookup
+                            )
+                            if cp_data['crossover']:
+                                crossover_json = json.dumps(cp_data['crossover'])
+                    elif mfrid_lookup:
                         cp_data = lookup_crossovers_and_packs(mfrid_lookup, part_number_lookup)
                         if cp_data['crossover']:
                             crossover_json = json.dumps(cp_data['crossover'])
@@ -223,8 +292,12 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
                 if ideal_cost_value is None:
                     ideal_cost_value = 0.0  # Default a 0.0 si no hay valor
                 
-                # Usar your_price, si es None usar 0.0
-                supplier_price_value = item.get('your_price')
+                # Usar tiered_price (precio unitario) si existe — Husqvarna lo provee.
+                # Para los demás suppliers que no tienen tiered_price, usar your_price.
+                # Si ninguno existe, usar 0.0.
+                supplier_price_value = item.get('tiered_price')
+                if supplier_price_value is None:
+                    supplier_price_value = item.get('your_price')
                 if supplier_price_value is None:
                     supplier_price_value = 0.0
 

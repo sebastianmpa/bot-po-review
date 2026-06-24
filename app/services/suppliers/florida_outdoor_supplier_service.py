@@ -142,10 +142,17 @@ class FloridaOutdoorSupplierService(SupplierService):
 
         try:
             credentials = self.get_credentials()
+
+            # Pre-fetch pack codes antes de la automatización
+            pack_map = self._pre_fetch_packs(po_data)
+            original_pns_upper = {p.partNumber.upper() for p in po_data.products}
+            pack_lookup_index = self._build_pack_lookup_index(pack_map, original_pns_upper)
+            extra_dict_items = self._build_pack_extra_dict_items(pack_map, original_pns_upper)
+
             po_items = [
                 {"part_number": p.partNumber, "qty": p.qty, "mfrid": p.mfrid, "mfrid_orig": p.mfrid_orig}
                 for p in po_data.products[:FOE_BATCH_SIZE]
-            ]
+            ] + extra_dict_items
 
             print(f"🤖 Ejecutando automatización [{self.supplier_name}]...")
             scraped_data = self.run_automation(
@@ -163,6 +170,12 @@ class FloridaOutdoorSupplierService(SupplierService):
                 )
 
             print(f"✅ Automatización completada. {len(scraped_data)} filas extraídas.")
+
+            # Extraer costos de packs y limpiar scraped_data
+            if pack_lookup_index:
+                scraped_data = self._apply_pack_costs_and_clean(
+                    scraped_data, pack_map, pack_lookup_index
+                )
 
             mfrid_orig_map = {p.partNumber: p.mfrid_orig for p in po_data.products}
             for item in scraped_data:
@@ -205,7 +218,12 @@ class FloridaOutdoorSupplierService(SupplierService):
         items = po_items or []
         if not items and po_data is not None:
             items = [
-                {"part_number": p.partNumber, "qty": p.qty, "mfrid": p.mfrid}  # ✅ INCLUIR MFRID
+                {
+                    "part_number": p.partNumber,
+                    "qty": p.qty,
+                    "mfrid": p.mfrid,
+                    "mfrid_orig": p.mfrid_orig
+                }
                 for p in po_data.products[:FOE_BATCH_SIZE]
             ]
         return florida_outdoor_automation_playwright(
@@ -238,6 +256,9 @@ class FloridaOutdoorSupplierService(SupplierService):
         mfrid_map: Dict[str, str] = {
             p.partNumber: p.mfrid for p in po_data.products
         }
+        mfrid_orig_map: Dict[str, str] = {
+            p.partNumber: p.mfrid_orig for p in po_data.products
+        }
 
         response_products: List[PurchaseOrderResponseProduct] = []
 
@@ -246,6 +267,9 @@ class FloridaOutdoorSupplierService(SupplierService):
             # Enriquecer mfrid: si viene del scraper usarlo, sino del mfrid_map
             scraped_mfrid = item.get("mfrid", "")
             item["mfrid"] = scraped_mfrid if scraped_mfrid else mfrid_map.get(part_number, "")
+            # ✅ Asegurar que mfrid_orig se preserva desde PO
+            if not item.get("mfrid_orig"):
+                item["mfrid_orig"] = mfrid_orig_map.get(part_number, "")
             your_price: Optional[Decimal] = item.get("your_price")
             pre_status: str = item.get("status", "CORRECT")
             error_message: Optional[str] = item.get("error_message")
