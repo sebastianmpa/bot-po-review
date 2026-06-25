@@ -184,7 +184,10 @@ def extract_table_data(page: Page, requested_qtys: Dict[str, int]) -> List[Dict]
                 try:
                     desc_cell = row.locator('div[data-label="Description"]')
                     if desc_cell.count() > 0:
-                        full_text = desc_cell.first.inner_text()
+                        # text_content() captura TODO el texto incluyendo nodos de texto
+                        # sueltos (ej: "Must ship via Motor Freight" no está en <p>).
+                        # inner_text() puede omitirlos si el CSS afecta la visibilidad.
+                        full_text = (desc_cell.first.text_content() or '')
                         full_text_lower = full_text.lower()
 
                         desc_ps = desc_cell.locator('p.ob__results__text').all()
@@ -391,6 +394,425 @@ def _parse_invalid_parts(page: Page) -> List[Dict]:
     return invalid
 
 
+# ── mfrid portal mapping ──────────────────────────────────────────────────────
+# El portal Briggs muestra 'BS' para Briggs & Stratton, pero en la PO viene 'BRS'
+_BRIGGS_MFRID_PORTAL_MAP: Dict[str, str] = {'BRS': 'BS'}
+
+
+def _get_portal_mfrid(mfrid: str) -> str:
+    """Convierte mfrid de la PO al código que muestra el portal Briggs (BS ≠ BRS)."""
+    return _BRIGGS_MFRID_PORTAL_MAP.get((mfrid or '').upper(), mfrid or 'BS')
+
+
+def _clear_table(page: Page) -> None:
+    """Click en 'Clear All' para vaciar la tabla del Build An Order."""
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(0.5)
+        btn = page.locator('a.ob__overview__clear')
+        if btn.count() > 0 and btn.first.is_visible():
+            btn.first.click()
+            time.sleep(1.5)
+            return
+        for _ in range(4):
+            page.evaluate("window.scrollBy(0, 600)")
+            time.sleep(0.3)
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click()
+                time.sleep(1.5)
+                return
+    except Exception:
+        pass
+
+
+def _make_part_error(item: Dict, requested_qty: int, ltl: bool = False) -> Dict:
+    """Crea entrada PART_ERROR cuando no se encuentra el ítem en el portal."""
+    pn = item.get('part_number', '')
+    return {
+        'mfrid': item.get('mfrid', ''),
+        'part_number': pn,
+        'description': '',
+        'availability': 'UNAVAILABLE',
+        'qty_available': 0,
+        'in_stock': 'N',
+        'qty': requested_qty,
+        'requested_qty': requested_qty,
+        'list_price': None,
+        'your_price': None,
+        'status': 'PART_ERROR',
+        'error_message': f'Part not found in portal: {pn}',
+        'superseded_from': None,
+        'nla': None,
+        'ltl': 'Y' if ltl else None,
+        'pack_qty': None,
+    }
+
+
+def _quick_ltl_scan(page: Page) -> set:
+    """
+    Scan rápido de la tabla de Build An Order para detectar LTL part numbers.
+    Solo lee el texto de la columna Description buscando keywords LTL y el
+    ícono de camión. NO hace hovers, NO extrae precios, NO extrae disponibilidad.
+    Retorna set de part_numbers (UPPER) que tienen LTL.
+    """
+    ltl_pns: set = set()
+    try:
+        rows = page.locator('div.ob__results__item').all()
+        print(f"  📋 Scan LTL rápido: {len(rows)} filas...")
+        for row in rows:
+            try:
+                # Part number
+                pn_elem = row.locator('div[data-label="Part #"]')
+                if pn_elem.count() == 0:
+                    continue
+                part_number = pn_elem.first.inner_text().strip()
+                if not part_number:
+                    continue
+
+                # Detectar LTL por texto de descripción
+                # NOTA: usar text_content() en lugar de inner_text() porque el texto
+                # LTL está en un nodo de texto directo (no dentro de <p>), y
+                # inner_text() puede omitirlo según el estado de renderizado CSS.
+                desc_cell = row.locator('div[data-label="Description"]')
+                if desc_cell.count() > 0:
+                    full_text = (desc_cell.first.text_content() or '').lower()
+                    for kw in LTL_KEYWORDS:
+                        if kw in full_text:
+                            ltl_pns.add(part_number.upper())
+                            print(f"  🚛 LTL detectado (texto): {part_number}")
+                            break
+
+                # Detectar LTL por ícono de camión
+                truck = row.locator(
+                    'i.ob__overview__icon.fa-truck, '
+                    'i.ob__overview__icon[class*="fa-truck"]'
+                )
+                if truck.count() > 0:
+                    ltl_pns.add(part_number.upper())
+                    print(f"  🚛 LTL detectado (truck icon): {part_number}")
+
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"  ⚠️  Error en scan LTL: {e}")
+    return ltl_pns
+
+
+def _phase_1_upload_csv(
+    page: Page,
+    csv_filename: str,
+    requested_qtys: Dict[str, int],
+    po_items: Optional[List[Dict]],
+) -> tuple:
+    """
+    FASE 1: Upload CSV → Build An Order → Scan rápido de LTL → Clear All.
+
+    Retorna ltl_pn_set: set[str] con los part numbers (UPPER) que tienen LTL.
+    La tabla queda LIMPIA (Clear All aplicado) lista para Phase 2.
+    """
+    print("\n" + "="*60)
+    print("📤 FASE 1: UPLOAD CSV → DETECTAR LTL → CLEAR ALL")
+    print("="*60)
+
+    # ── Upload An Order ────────────────────────────────────────────────
+    print("📤 Navegando a Upload An Order...")
+    upload_link = page.locator('a.dashboard__subnav__link[href="/portal/upload-order"]')
+    if upload_link.count() == 0:
+        upload_link = page.locator('a[href="/portal/upload-order"]')
+    upload_link.first.wait_for(state='visible', timeout=10000)
+    upload_link.first.click()
+    time.sleep(3)
+
+    downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
+    csv_path = os.path.join(downloads_path, csv_filename)
+    print("📁 Subiendo CSV...")
+    file_input = page.locator('input#order[type="file"]')
+    if file_input.count() == 0:
+        file_input = page.locator('input[type="file"]')
+    file_input.wait_for(state='attached', timeout=15000)
+    file_input.set_input_files(csv_path)
+    print(f"✅ {csv_filename} adjuntado. Esperando procesamiento...")
+
+    orbit = page.locator('div.pd-orbit.js--pd-orbit')
+    try:
+        orbit.wait_for(state='visible', timeout=10_000)
+        print("  ⏳ Overlay visible — esperando...")
+    except Exception:
+        print("  ℹ️  Overlay no detectado.")
+    try:
+        orbit.wait_for(state='hidden', timeout=90_000)
+        print("  ✅ Overlay desaparecido — CSV procesado.")
+    except Exception:
+        print("  ⚠️  Timeout overlay — esperando 35s...")
+        time.sleep(35)
+    time.sleep(2)
+
+    # ── Ir a Build An Order para ver resultados del upload ─────────────
+    print("🛒 Navegando a Build An Order para scan LTL...")
+    build_sub = page.locator('a.dashboard__subnav__link[href="/portal/build-order"]')
+    if build_sub.count() == 0:
+        build_sub = page.locator('a[href="/portal/build-order"]').first
+    try:
+        orbit.wait_for(state='hidden', timeout=10_000)
+    except Exception:
+        pass
+    build_sub.first.wait_for(state='visible', timeout=10000)
+    build_sub.first.click()
+    time.sleep(3)
+
+    # ── Esperar tabla del upload ────────────────────────────────────────
+    try:
+        page.wait_for_selector('div.ob__results__item', timeout=30000)
+        time.sleep(1)
+    except Exception:
+        print("  ℹ️  No hay filas en tabla tras el upload.")
+        return set()
+
+    # ── Scan rápido: solo detectar LTL ─────────────────────────────────
+    ltl_pn_set = _quick_ltl_scan(page)
+    print(f"\n🚛 LTL DETECTADOS EN FASE 1: {len(ltl_pn_set)}")
+    for pn in ltl_pn_set:
+        print(f"  • {pn}")
+
+    # ── Clear All: limpiar tabla antes de Phase 2 ───────────────────────
+    print("\n🗑️  Clear All (Phase 1 finaliza con tabla limpia)...")
+    _clear_table(page)
+    time.sleep(1)
+    print("✅ Tabla limpia. Lista para Phase 2.")
+
+    return ltl_pn_set
+
+
+def _phase_2_item_by_item(
+    page: Page,
+    po_items: List[Dict],
+    ltl_pn_set: set,
+    requested_qtys: Dict[str, int],
+) -> List[Dict]:
+    """
+    FASE 2:
+      Tabla ya limpia (Phase 1 hizo Clear All).
+
+      Para cada part_number ÚNICO:
+        1. Buscar en typeahead → recolectar TODOS los mfrid disponibles en el dropdown
+        2. Para cada variante (mfrid, pn) de la PO:
+             - Si portal_mfrid del body está en el dropdown → válida
+             - Si NO está → PART_ERROR inmediato para esa variante
+        3. Añadir el pn al carrito UNA SOLA VEZ (si al menos 1 variante es válida)
+
+      Luego scrape único y reconciliación por (mfrid_upper, pn_upper).
+    """
+    import copy as _copy
+    from collections import defaultdict
+
+    print("\n" + "="*60)
+    print(f"🔍 FASE 2: VALIDAR {len(po_items)} COMBINACIONES → SCRAPE ÚNICO AL FINAL")
+    print("="*60)
+    print("  (tabla ya limpiada por Fase 1)")
+
+    # Agrupar po_items por pn_upper preservando orden de aparición
+    items_by_pn: Dict[str, List[Dict]] = defaultdict(list)
+    ordered_pns: List[str] = []
+    seen_pns: set = set()
+    for item in po_items:
+        pn = (item.get('part_number') or '').strip()
+        pn_up = pn.upper()
+        if pn_up not in seen_pns:
+            seen_pns.add(pn_up)
+            ordered_pns.append(pn_up)
+        items_by_pn[pn_up].append(item)
+
+    # (mfrid_upper, pn_upper) → dict PART_ERROR
+    part_errors: Dict[tuple, Dict] = {}
+    valid_pns: set = set()   # pn_upper añadidos exitosamente al carrito
+    added_count = 0
+
+    # ── Buscar cada pn único, validar variantes, añadir UNA VEZ ────────────
+    for pn_upper in ordered_pns:
+        variants = items_by_pn[pn_upper]
+        first    = variants[0]
+        pn       = (first.get('part_number') or '').strip()
+        qty      = first.get('qty', 1)
+        req_qty  = first.get('requested_qty') or requested_qtys.get(pn, qty)
+        is_ltl   = pn_upper in ltl_pn_set
+
+        # Portal mfrids requeridos por la PO
+        required = {_get_portal_mfrid(it.get('mfrid') or 'BRS').upper() for it in variants}
+        print(f"\n── {pn} | {len(variants)} variante(s): {required}")
+
+        try:
+            search_input = page.locator('#ob-search')
+            search_input.wait_for(state='visible', timeout=5000)
+            search_input.fill('')
+            time.sleep(0.3)
+            search_input.type(pn, delay=60)
+            time.sleep(1.2)
+
+            # Esperar dropdown
+            dropdown = page.locator('div.ob__search__dropdown-wrapper--active')
+            try:
+                dropdown.wait_for(state='visible', timeout=6000)
+            except Exception:
+                print(f"  ❌ Dropdown no apareció → PART_ERROR todas las variantes")
+                search_input.fill('')
+                for it in variants:
+                    mfr_up = (it.get('mfrid') or 'BRS').upper()
+                    part_errors[(mfr_up, pn_upper)] = _make_part_error(it, req_qty, ltl=is_ltl)
+                continue
+
+            # Recolectar todos los mfrid disponibles en el dropdown para este pn
+            available_portal_mfrids: set = set()
+            first_valid_card = None
+            cards = page.locator('div.ob__searchcard')
+            for card in cards.all():
+                try:
+                    spans = card.locator('p.ob__searchcard__title span').all()
+                    if len(spans) >= 2:
+                        card_mfr = spans[0].inner_text().strip().rstrip(',').strip().upper()
+                        card_pn  = spans[1].inner_text().strip().upper()
+                        if card_pn == pn_upper:
+                            available_portal_mfrids.add(card_mfr)
+                            if first_valid_card is None:
+                                first_valid_card = card
+                except Exception:
+                    continue
+
+            print(f"  📋 Disponibles en portal: {available_portal_mfrids or '(ninguno)'}")
+
+            # Validar cada variante (mfrid, pn) individualmente (para logging)
+            # NOTA: si el pn fue encontrado bajo CUALQUIER mfrid, todas las variantes
+            # recibirán ese precio en la reconciliación. part_errors solo se aplica cuando
+            # el pn no fue encontrado bajo NINGÚN mfrid.
+            has_valid_variant = False
+            for it in variants:
+                mfrid    = (it.get('mfrid') or 'BRS').strip()
+                mfrid_up = mfrid.upper()
+                pmfrid   = _get_portal_mfrid(mfrid).upper()
+
+                if pmfrid in available_portal_mfrids:
+                    print(f"  ✓  {mfrid},{pn} → portal:{pmfrid} disponible")
+                    has_valid_variant = True
+                else:
+                    print(f"  ❌ {mfrid},{pn} → portal:{pmfrid} NO en portal → PART_ERROR")
+                    part_errors[(mfrid_up, pn_upper)] = _make_part_error(it, req_qty, ltl=is_ltl)
+
+            if not has_valid_variant or first_valid_card is None:
+                print(f"  ❌ Sin variantes válidas para {pn} — no se añade al carrito")
+                search_input.fill('')
+                continue
+
+            # Añadir al carrito UNA sola vez
+            first_valid_card.click()
+            time.sleep(0.5)
+            qty_input = page.locator('#qty')
+            qty_input.wait_for(state='visible', timeout=3000)
+            qty_input.fill(str(req_qty))
+            page.locator('a.ob__search__btn').click()
+            time.sleep(1.5)
+            added_count += 1
+            valid_pns.add(pn_upper)
+            print(f"  ✓  Añadido al carrito ({added_count} pns únicos)")
+
+        except Exception as e:
+            print(f"  ❌ Excepción {pn}: {e}")
+            for it in variants:
+                mfr_up = (it.get('mfrid') or 'BRS').upper()
+                part_errors[(mfr_up, pn_upper)] = _make_part_error(it, req_qty, ltl=is_ltl)
+
+    print(f"\n📋 Pns únicos añadidos: {added_count} | Con PART_ERROR: {len(set(k[1] for k in part_errors))}")
+
+    # ── Scrape tabla completa UNA VEZ ────────────────────────────────────────
+    all_requested = {
+        (it.get('part_number') or ''): (it.get('requested_qty') or it.get('qty', 1))
+        for it in po_items if it.get('part_number')
+    }
+    all_requested.update(requested_qtys)
+
+    scraped_rows: List[Dict] = []
+    if added_count > 0:
+        print(f"\n⏳ Scrapeando tabla ({added_count} filas esperadas)...")
+        time.sleep(2)
+        try:
+            page.wait_for_selector('div.ob__results__item', timeout=15000)
+            time.sleep(2)
+            scraped_rows = extract_table_data(page, all_requested)
+            print(f"✅ Scrape final: {len(scraped_rows)} filas")
+        except Exception as e:
+            print(f"  ⚠️  Error en scrape final: {e}")
+
+    # Índices por pn (primera ocurrencia) y por superseded_from
+    scraped_by_pn: Dict[str, Dict] = {}
+    for r in scraped_rows:
+        pn_up = r['part_number'].upper()
+        if pn_up not in scraped_by_pn:
+            scraped_by_pn[pn_up] = r
+
+    scraped_by_superseded: Dict[str, Dict] = {}
+    for r in scraped_rows:
+        sf = (r.get('superseded_from') or '').upper().strip()
+        if sf and sf not in scraped_by_superseded:
+            scraped_by_superseded[sf] = r
+
+    # ── Reconciliar: cada (mfrid, pn) → su propio resultado ────────────────
+    # Prioridad (POR COMBINACIÓN mfrid+pn):
+    #   1. err_key in part_errors  → este mfrid específico NO existe en portal → PART_ERROR
+    #                                 (ej: OCS,392-133 → PART_ERROR aunque OEP sí exista)
+    #   2. pn_up in scraped_by_pn  → este mfrid SÍ existe en portal → usar precio scrapeado
+    #   3. scraped_by_superseded   → pn fue supersedido
+    #   4. fallback                → _make_part_error
+    results: List[Dict] = []
+    for item in po_items:
+        pn       = (item.get('part_number') or '').strip()
+        pn_up    = pn.upper()
+        mfrid    = (item.get('mfrid') or '').strip()
+        mfrid_up = mfrid.upper()
+        err_key  = (mfrid_up, pn_up)
+        if not pn:
+            continue
+
+        is_ltl  = pn_up in ltl_pn_set
+        req_qty = item.get('requested_qty') or requested_qtys.get(pn, item.get('qty', 1))
+
+        if err_key in part_errors:
+            # Este mfrid específico NO fue encontrado en el portal → PART_ERROR
+            # (OCS y SPO son PART_ERROR aunque OEP sí exista para el mismo pn)
+            print(f"  ❌ {mfrid},{pn} → PART_ERROR (no encontrado en portal)")
+            results.append(part_errors[err_key])
+
+        elif pn_up in scraped_by_pn:
+            # Este mfrid SÍ fue encontrado en portal → usar precio del scrape
+            scraped = _copy.deepcopy(scraped_by_pn[pn_up])
+            scraped['mfrid'] = mfrid   # preservar mfrid del PO body
+            if is_ltl:
+                scraped['ltl'] = 'Y'
+            print(
+                f"  💵 {mfrid},{pn} | Cost:{scraped.get('your_price')} | "
+                f"Status:{scraped.get('status')} | LTL:{scraped.get('ltl')}"
+            )
+            results.append(scraped)
+
+        elif pn_up in scraped_by_superseded:
+            scraped = _copy.deepcopy(scraped_by_superseded[pn_up])
+            scraped['mfrid'] = mfrid
+            if is_ltl:
+                scraped['ltl'] = 'Y'
+            print(f"  🔄 SUPERSEDED {mfrid},{pn} → {scraped.get('part_number')}")
+            results.append(scraped)
+
+        else:
+            print(f"  ⚠️  {mfrid},{pn} no en tabla → PART_ERROR")
+            results.append(_make_part_error(item, req_qty, ltl=is_ltl))
+
+    # Limpiar carrito al finalizar
+    print("\n🗑️  Limpiando carrito (fin de Fase 2)...")
+    _clear_table(page)
+
+    ok     = sum(1 for r in results if r.get('status') == 'CORRECT')
+    errors = sum(1 for r in results if r.get('status') != 'CORRECT')
+    print(f"\n✅ FASE 2: {len(results)} combinaciones | ✅ {ok} | ❌ {errors}")
+    return results
+
+
 def briggs_login_automation_playwright(
     username: str,
     password: str,
@@ -399,22 +821,24 @@ def briggs_login_automation_playwright(
     po_items: Optional[List[Dict]] = None,
 ) -> Optional[List[Dict]]:
     """
-    Flujo completo de automatización Briggs & Stratton.
+    Flujo Briggs & Stratton en dos fases:
 
-    Pasos:
-      1.  Login con username / password
-      2.  Esperar dashboard
-      3.  Click en 'Build an Order'
-      4.  Click en 'Upload An Order'
-      5.  Subir CSV via file input
-      6.  Esperar resultados
-      7.  Scrapear tabla
-      8.  Retornar datos
+    FASE 1 (Upload CSV):
+      - Sube el CSV al portal → scrapea la tabla completa
+      - Identifica qué part numbers son LTL y guarda el set en memoria
+
+    FASE 2 (Item-by-item):
+      - Para CADA ítem de la PO, busca via typeahead en Build An Order
+      - Selecciona la opción que coincide (portal_mfrid BS + part#)
+      - Ingresa qty → Add Part → scrapea la fila para obtener precio real
+      - Aplica ltl='Y' si el part# fue detectado en Fase 1
+
+    Retorna List[Dict] con los resultados de Fase 2 (precios reales del portal).
     """
     if requested_qtys is None:
         requested_qtys = {}
 
-    print("🚀 Iniciando automatización Briggs & Stratton con Playwright...")
+    print("🚀 Iniciando automatización Briggs & Stratton (2 fases)...")
 
     downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
     csv_path = os.path.join(downloads_path, csv_filename)
@@ -444,17 +868,15 @@ def briggs_login_automation_playwright(
     print("✅ Edge iniciado.")
 
     try:
-        # ── 1. Ir al portal ───────────────────────────────────────────────
+        # ── Login ──────────────────────────────────────────────────
         print(f"🌐 Navegando a {BRIGGS_BASE_URL}...")
         page.goto(BRIGGS_BASE_URL, wait_until="domcontentloaded")
         time.sleep(3)
 
-        # ── 2. Login ──────────────────────────────────────────────────────
         print("🔐 Ingresando credenciales...")
         username_input = page.locator('#Username')
         username_input.wait_for(state='visible', timeout=10000)
         username_input.fill(username)
-
         page.locator('#Password').fill(password)
 
         print("🖱️ Enviando formulario de login...")
@@ -462,8 +884,7 @@ def briggs_login_automation_playwright(
         time.sleep(4)
         print(f"✅ Login exitoso. URL: {page.url}")
 
-        # ── 3. Click en 'Build an Order' (menú principal) ───────────────────
-        # Esto carga el subnav con Upload An Order y Build An Order
+        # ── Click en 'Build an Order' (menú principal) ───────────────
         print("🛒 Navegando a Build an Order (menú principal)...")
         build_main = page.locator('a.db__link__title[href="/portal/build-order"]')
         if build_main.count() == 0:
@@ -473,181 +894,35 @@ def briggs_login_automation_playwright(
         time.sleep(3)
         print("✅ Sección Build an Order cargada.")
 
-        # ── 4. Click en 'Upload An Order' (subnav) ───────────────────────────
-        print("📤 Navegando a Upload An Order (subnav)...")
-        upload_link = page.locator('a.dashboard__subnav__link[href="/portal/upload-order"]')
-        if upload_link.count() == 0:
-            upload_link = page.locator('a[href="/portal/upload-order"]')
-        upload_link.first.wait_for(state='visible', timeout=10000)
-        upload_link.first.click()
-        time.sleep(3)
-        print("✅ Upload An Order cargado.")
-
-        # ── 5. Subir CSV ─────────────────────────────────────────────────────
-        print("📁 Subiendo archivo CSV...")
-        file_input = page.locator('input#order[type="file"]')
-        if file_input.count() == 0:
-            file_input = page.locator('input[type="file"]')
-        file_input.wait_for(state='attached', timeout=15000)
-        file_input.set_input_files(csv_path)
-        print(f"✅ Archivo {csv_filename} adjuntado. Esperando procesamiento del portal...")
-
-        # El portal Briggs muestra un overlay div.pd-orbit.js--pd-orbit mientras
-        # procesa el CSV (~30 s). Hay que esperar a que desaparezca antes de
-        # intentar cualquier clic — de lo contrario intercepta los pointer events
-        # y Playwright lanza TimeoutError aunque el enlace sea visible y estable.
-        orbit = page.locator('div.pd-orbit.js--pd-orbit')
-        try:
-            # Esperar a que el overlay aparezca (confirma que el portal arrancó)
-            orbit.wait_for(state='visible', timeout=10_000)
-            print("  ⏳ Overlay de procesamiento visible — esperando que termine...")
-        except Exception:
-            print("  ℹ️  Overlay no detectado al inicio — puede que el portal ya procesó.")
-
-        try:
-            # Esperar hasta 90 s a que el overlay desaparezca completamente
-            orbit.wait_for(state='hidden', timeout=90_000)
-            print("  ✅ Overlay desaparecido — CSV procesado.")
-        except Exception:
-            print("  ⚠️  Timeout esperando overlay — esperando 35 s adicionales...")
-            time.sleep(35)
-
-        # Pausa extra para que el DOM se estabilice tras el procesamiento
-        time.sleep(2)
-        print(f"✅ Archivo {csv_filename} cargado y procesado.")
-
-        # ── 6. Click en 'Build An Order' (subnav) — aquí aparece la tabla ────
-        print("🛒 Navegando a Build An Order (subnav) para ver resultados...")
-        build_sub = page.locator('a.dashboard__subnav__link[href="/portal/build-order"]')
-        if build_sub.count() == 0:
-            build_sub = page.locator('a[href="/portal/build-order"]').first
-
-        # Segunda verificación: asegurar que el overlay no esté bloqueando el clic
-        try:
-            orbit.wait_for(state='hidden', timeout=15_000)
-        except Exception:
-            pass  # Si ya está oculto o no existe, continuar
-
-        build_sub.first.wait_for(state='visible', timeout=10000)
-        build_sub.first.click()
-        time.sleep(3)
-        print("✅ Build An Order (subnav) cargado.")
-
-        # ── 7. Esperar tabla de resultados ────────────────────────────────────
-        print("⏳ Esperando tabla de resultados (div.ob__results__item)...")
-        page.wait_for_selector('div.ob__results__item', timeout=60000)
-        time.sleep(5)
-        print("▶️  Tabla lista. Iniciando scraping...")
-
-        # ── 8. Scrapear tabla válida ──────────────────────────────────────
-        cart_data = extract_table_data(page, requested_qtys)
-        print(f"✅ Scraping completado. {len(cart_data)} ítems extraídos.")
-
-        # ── 8b. Capturar Invalid Parts (NLA rechazados por el portal) ──────
-        invalid_parts = _parse_invalid_parts(page)
-        # Lookup de qty por (mfrid_upper, pn_upper) → fallback a requested_qtys
-        po_qty_by_mfrid_pn: Dict[tuple, int] = {}
-        if po_items:
-            for it in po_items:
-                mfr = (it.get('mfrid') or '').upper()
-                _pn = (it.get('part_number') or it.get('partNumber', '')).upper()
-                po_qty_by_mfrid_pn[(mfr, _pn)] = it.get('qty', 0)
-        for inv in invalid_parts:
-            mfr_up = (inv.get('mfrid') or '').upper()
-            pn_up = inv['part_number'].upper()
-            req_qty = (
-                po_qty_by_mfrid_pn.get((mfr_up, pn_up))
-                or requested_qtys.get(inv['part_number'], 0)
-            )
-            inv['requested_qty'] = req_qty
-            inv['qty'] = req_qty
-        if invalid_parts:
-            print(f"⚠️  {len(invalid_parts)} ítem(s) en 'Invalid Parts' → NLA.")
-            cart_data.extend(invalid_parts)
-
-        # ── 9. Limpiar tabla con 'Clear All' (scroll al fondo para revelarlo) ─
-        print("🗑️  Limpiando tabla con 'Clear All'...")
-        try:
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(1)
-            clear_all_btn = page.locator('a.ob__overview__clear')
-            if clear_all_btn.count() == 0 or not clear_all_btn.first.is_visible():
-                for _ in range(4):
-                    page.evaluate("window.scrollBy(0, 600)")
-                    time.sleep(0.4)
-                    if clear_all_btn.count() > 0 and clear_all_btn.first.is_visible():
-                        break
-            if clear_all_btn.count() > 0 and clear_all_btn.first.is_visible():
-                clear_all_btn.first.click()
-                time.sleep(2)
-                print("  ✅ Tabla limpiada con 'Clear All'.")
-            else:
-                print("  ⚠️ Botón 'Clear All' no encontrado — tabla puede quedar con ítems.")
-        except Exception as _e:
-            print(f"  ⚠️ Error limpiando con 'Clear All': {_e}")
-
-        # ── 9b. Reconciliar: garantizar un resultado por (mfrid, part) ───────
-        # covered_no_mfrid  → pn cubierto por entrada con mfrid='' (cubre todas las variantes)
-        # covered_with_mfrid → (MFRID_UPPER, PN_UPPER) con mfrid explícito
-        covered_no_mfrid: set = set()
-        covered_with_mfrid: set = set()
-        for r in cart_data:
-            pn_up = r['part_number'].upper()
-            mfr_up = (r.get('mfrid') or '').upper()
-            if mfr_up:
-                covered_with_mfrid.add((mfr_up, pn_up))
-            else:
-                covered_no_mfrid.add(pn_up)
-            if r.get('superseded_from'):
-                covered_no_mfrid.add(r['superseded_from'].upper())
-
-        items_to_check = (
-            po_items if po_items else
-            [{'mfrid': '', 'part_number': pn, 'qty': qty}
-             for pn, qty in requested_qtys.items()]
+        # ── FASE 1: Upload CSV → scan LTL → Clear All ───────────────
+        ltl_pn_set = _phase_1_upload_csv(
+            page, csv_filename, requested_qtys, po_items
         )
-        for itm in items_to_check:
-            mfrid_orig = (itm.get('mfrid') or '')
-            pn_orig = itm.get('part_number') or itm.get('partNumber', '')
-            req_qty = itm.get('qty', 0)
-            if not pn_orig:
-                continue
-            mfr_up = mfrid_orig.upper()
-            pn_up = pn_orig.upper()
-            # Cubierto si: a) hay entrada sin mfrid para este pn (cubre todas las variantes)
-            #             b) hay coincidencia exacta (mfrid, pn)
-            #             c) el input no tiene mfrid y existe cualquier entrada para este pn
-            if pn_up in covered_no_mfrid:
-                continue
-            if mfr_up and (mfr_up, pn_up) in covered_with_mfrid:
-                continue
-            if not mfr_up and any(p == pn_up for _, p in covered_with_mfrid):
-                continue
-            print(f"  ⚠️ '{mfrid_orig}/{pn_orig}' sin resultado en el portal → PART_ERROR.")
-            cart_data.append({
-                'mfrid': mfrid_orig,
-                'part_number': pn_orig,
-                'description': '',
-                'availability': 'UNAVAILABLE',
-                'qty_available': 0,
-                'in_stock': 'N',
-                'qty': req_qty,
-                'requested_qty': req_qty,
-                'list_price': None,
-                'your_price': None,
-                'status': 'PART_ERROR',
-                'error_message': f'Part not found in portal results: {pn_orig}',
-                'superseded_from': None,
-                'nla': None,
-                'ltl': None,
-                'pack_qty': None,
-            })
+        print(f"\n📝 Fase 1 completa | LTL detectados: {len(ltl_pn_set)}")
 
-        ok = sum(1 for r in cart_data if r['status'] == 'CORRECT')
-        errors = sum(1 for r in cart_data if r['status'] != 'CORRECT')
-        print(f"\n📊 Total: {len(cart_data)} | ✅ CORRECT: {ok} | ❌ Errores: {errors}")
+        # ── FASE 2: Item-by-item para TODOS los ítems ───────────────
+        items_for_phase2 = po_items if po_items else [
+            {'mfrid': '', 'part_number': pn, 'qty': qty, 'requested_qty': qty}
+            for pn, qty in requested_qtys.items()
+        ]
 
-        return cart_data
+        if not items_for_phase2:
+            print("⚠️  Sin ítems para Fase 2 — sin datos.")
+            return []
+
+        # Phase 1 ya dejó la página en build-order con tabla limpia
+        # Solo verificar que #ob-search esté disponible
+        page.wait_for_selector('#ob-search', timeout=10000)
+        print("✅ Build An Order listo — iniciando carga item a item...")
+
+        final_results = _phase_2_item_by_item(
+            page, items_for_phase2, ltl_pn_set, requested_qtys
+        )
+
+        ok     = sum(1 for r in final_results if r.get('status') == 'CORRECT')
+        errors = sum(1 for r in final_results if r.get('status') != 'CORRECT')
+        print(f"\n📊 FINAL: {len(final_results)} | ✅ {ok} | ❌ {errors}")
+        return final_results
 
     except Exception as e:
         print(f"❌ Error durante la automatización Briggs: {e}")

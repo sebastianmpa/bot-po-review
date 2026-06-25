@@ -27,8 +27,7 @@ from services.suppliers.base_supplier_service import SupplierService
 from seo_scripts.florida_outdoor_playwright import florida_outdoor_automation_playwright
 from seo_scripts.insert_data_in_db import insert_po_review_details
 
-# Máximo de ítems por batch en el Order Pad
-FOE_BATCH_SIZE = 100
+
 
 
 class FloridaOutdoorSupplierService(SupplierService):
@@ -81,13 +80,6 @@ class FloridaOutdoorSupplierService(SupplierService):
         - Columna Quantity: entero explícito
         - Limita a los primeros FOE_BATCH_SIZE ítems
         """
-        batch = products[:FOE_BATCH_SIZE]
-        if len(products) > FOE_BATCH_SIZE:
-            print(
-                f"⚠️  [{self.supplier_name}] PO tiene {len(products)} ítems. "
-                f"Solo se procesarán los primeros {FOE_BATCH_SIZE}."
-            )
-
         temp_dir = os.path.join(os.path.expanduser("~"), "Downloads", "temp_purchase_orders")
         os.makedirs(temp_dir, exist_ok=True)
         xlsx_path = os.path.join(temp_dir, xlsx_filename)
@@ -100,7 +92,7 @@ class FloridaOutdoorSupplierService(SupplierService):
         ws.append(self.csv_headers())
 
         # Filas de datos — escribir celdas individualmente para forzar tipos
-        for product in batch:
+        for product in products:
             row_data = self.csv_row(product)          # [partNumber, qty, "EA"]
             r = ws.max_row + 1
 
@@ -115,7 +107,7 @@ class FloridaOutdoorSupplierService(SupplierService):
             ws.cell(row=r, column=3, value=str(row_data[2]))
 
         wb.save(xlsx_path)
-        print(f"✅ Excel creado: {xlsx_filename} ({len(batch)} productos)")
+        print(f"✅ Excel creado: {xlsx_filename} ({len(products)} productos)")
         return xlsx_path
 
     def _cleanup(self, csv_path, final_csv_path) -> None:
@@ -136,8 +128,7 @@ class FloridaOutdoorSupplierService(SupplierService):
         print(f"📦 PO Number: {po_data.poNumber}")
         print(f"🏢 Supplier ID: {po_data.supplerID}")
         total = len(po_data.products)
-        batch = min(total, FOE_BATCH_SIZE)
-        print(f"📦 Total de productos: {total} (procesando {batch})")
+        print(f"📦 Total de productos: {total}")
         print("=" * 60)
 
         try:
@@ -151,7 +142,7 @@ class FloridaOutdoorSupplierService(SupplierService):
 
             po_items = [
                 {"part_number": p.partNumber, "qty": p.qty, "mfrid": p.mfrid, "mfrid_orig": p.mfrid_orig}
-                for p in po_data.products[:FOE_BATCH_SIZE]
+                for p in po_data.products
             ] + extra_dict_items
 
             print(f"🤖 Ejecutando automatización [{self.supplier_name}]...")
@@ -224,7 +215,7 @@ class FloridaOutdoorSupplierService(SupplierService):
                     "mfrid": p.mfrid,
                     "mfrid_orig": p.mfrid_orig
                 }
-                for p in po_data.products[:FOE_BATCH_SIZE]
+                for p in po_data.products
             ]
         return florida_outdoor_automation_playwright(
             username=email,

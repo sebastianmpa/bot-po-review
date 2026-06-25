@@ -91,12 +91,42 @@ class BriggsSupplierService(SupplierService):
         po_data: Optional[PurchaseOrderDataModel] = None,
         **kwargs,
     ) -> Optional[List[Dict]]:
+        import csv as _csv_module
         requested_qtys: Dict[str, int] = {}
         po_items_list: List[Dict] = []
-        if po_data is not None:
+
+        # Leer el CSV ya copiado a Downloads para obtener TODOS los ítems,
+        # incluyendo los pack extras añadidos por base_supplier_service.execute().
+        # Así Phase 2 también busca y captura precios de packs.
+        downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
+        csv_path = os.path.join(downloads_path, csv_filename)
+        if os.path.exists(csv_path):
+            try:
+                with open(csv_path, newline='', encoding='utf-8') as f:
+                    reader = _csv_module.DictReader(f, delimiter='\t')
+                    for row in reader:
+                        pn      = (row.get('Part Number')  or '').strip()
+                        mfr     = (row.get('Manufacturer') or '').strip()
+                        qty_str = (row.get('Quantity')     or '1').strip()
+                        qty     = int(qty_str) if qty_str.isdigit() else 1
+                        if pn:
+                            requested_qtys[pn] = qty
+                            po_items_list.append({
+                                'mfrid': mfr,
+                                'part_number': pn,
+                                'qty': qty,
+                                'requested_qty': qty,
+                            })
+                print(f"  📋 CSV leído: {len(po_items_list)} ítems (inc. packs)")
+            except Exception as e:
+                print(f"  ⚠️  Error leyendo CSV: {e} — fallback a po_data")
+
+        # Fallback si no se pudo leer el CSV
+        if not po_items_list and po_data is not None:
             requested_qtys = {p.partNumber: p.qty for p in po_data.products}
             po_items_list = [
-                {'mfrid': p.mfrid, 'part_number': p.partNumber, 'qty': p.qty}
+                {'mfrid': p.mfrid, 'part_number': p.partNumber,
+                 'qty': p.qty, 'requested_qty': p.qty}
                 for p in po_data.products
             ]
 
