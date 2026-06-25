@@ -1015,31 +1015,13 @@ if __name__ == "__main__":
     TEST_PO_ITEMS = [
         # SUPERSEDED: 125256 → 125255P
         {
-            "part_number": "004168",
+            "part_number": "784991",
             "qty": 1,
             "mfrid": "CP",
             "idealCost": 0.0,
         },
-         {
-            "part_number": "108123",
-            "qty": 1,
-            "mfrid": "CP",
-            "idealCost": 0.0,
-        },
-         {
-            "part_number": "068478",
-            "qty": 1,
-            "mfrid": "CP",
-            "idealCost": 0.0,
-        },
-         {
-            "part_number": "036384",
-            "qty": 1,
-            "mfrid": "CP",
-            "idealCost": 0.0,
-        },
-         {
-            "part_number": "032714",
+        {
+            "part_number": "784991",
             "qty": 1,
             "mfrid": "CP",
             "idealCost": 0.0,

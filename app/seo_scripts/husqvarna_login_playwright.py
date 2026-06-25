@@ -270,11 +270,14 @@ def _scrape_cart_page(page: Page, requested_qtys: Dict[str, int], results: List[
             # ── Kit / paquete ───────────────────────────────────────────
             requested_qty = requested_qtys.get(part_number, cart_qty)
             is_kit = cart_qty > requested_qty
+            # pack_qty: cantidad mínima de paquete impuesta por el portal
+            # cuando dice "quantity has been changed" al mínimo de pack
+            pack_qty = cart_qty if is_kit else None
 
             if is_kit:
                 print(
-                    f"    📦 KIT: {part_number} | "
-                    f"Solicitado: {requested_qty} | Mínimo: {cart_qty}"
+                    f"    📦 KIT/PACK: {part_number} | "
+                    f"Solicitado: {requested_qty} | Mínimo pack: {cart_qty}"
                 )
 
             # qty_available: si el ítem tiene error (NLA) → 0; si está en carrito → usar cart_qty
@@ -291,12 +294,14 @@ def _scrape_cart_page(page: Page, requested_qtys: Dict[str, int], results: List[
                 'qty_available': cart_qty if _has_stock else 0,
                 'in_stock': 'Y' if _has_stock else 'N',
                 'is_kit': is_kit,
+                'pack_qty': pack_qty,
                 'tiered_price': tiered_price,
                 'your_price': your_price,
                 'status': item_status,
                 'error_message': item_error_message,
                 'nla': nla,
                 'superseded_from': superseded_from,
+                'ltl': None,
             })
             print(
                 f"    ✓ [{base_idx + idx}] {part_number} | "
@@ -481,11 +486,171 @@ def _clear_husqvarna_cart(page: Page) -> None:
         print(f"  ⚠️ Error verificando carrito Husqvarna: {e}")
 
 
+def _husqvarna_checkout_ltl_scan(page: Page, po_number: str) -> set:
+    """
+    Desde la página del carrito:
+      1. Selecciona todos los ítems
+      2. Llena PO# y Order Reference en el formulario
+      3. Click 'Checkout' → espera #order-review-cart-cart-table
+      4. Escanea cada fila buscando 'Freight Category: X' (X no vacío) → ltl='Y'
+      5. Click 'Back' para volver al carrito
+
+    La columna Description en la tabla de revisión muestra:
+      <p>Freight Category:  </p>   → vacío = NO LTL
+      <p>Freight Category: P1</p>  → valor presente = LTL
+
+    Retorna set de part_numbers (str) con LTL detectado.
+    """
+    ltl_pns: set = set()
+    try:
+        # 1. Seleccionar todos los ítems del carrito
+        print("  ☑️ Seleccionando todos para checkout LTL scan...")
+        select_all = page.locator(
+            'th[data-testid="cart-delivery-header-row-head-cell-checkbox"] '
+            'input[aria-label="Select all items"]'
+        )
+        if select_all.count() > 0:
+            select_all.first.click()
+            time.sleep(1)
+        else:
+            print("  ⚠️ Checkbox 'Select all' no encontrado — continuando")
+
+        # 2. Llenar formulario Order Reference Details
+        page.evaluate("window.scrollTo(0, 0)")
+        time.sleep(0.5)
+        po_input = page.locator('input[name="poNumber"]')
+        if po_input.count() > 0:
+            po_input.first.fill(str(po_number))
+            time.sleep(0.3)
+        ref_input = page.locator('input[name="orderReferenceNumber"]')
+        if ref_input.count() > 0:
+            ref_input.first.fill("test")
+            time.sleep(0.3)
+
+        # 3. Click Checkout (scroll al fondo para encontrar el botón)
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(0.5)
+        checkout_btn = page.locator('button[data-testid="cart-checkout"]')
+        if checkout_btn.count() == 0:
+            print("  ⚠️ Botón Checkout no encontrado — saltando scan LTL")
+            return ltl_pns
+        checkout_btn.first.scroll_into_view_if_needed()
+        checkout_btn.first.click()
+        print("  ✅ Click Checkout — esperando página de revisión...")
+        time.sleep(5)
+
+        # 4. Esperar tabla de revisión
+        try:
+            page.wait_for_selector('#order-review-cart-cart-table', timeout=15000)
+            time.sleep(2)
+        except Exception:
+            print("  ⚠️ Tabla de revisión no cargó — saltando scan LTL")
+            return ltl_pns
+
+        # Escanear todas las páginas de la tabla de revisión
+        page_num = 1
+        while True:
+            current, total = _get_pagination_info(page)
+            print(f"  📄 Scan LTL checkout — página {current}/{total}...")
+
+            rows = page.locator(
+                '#order-review-cart-cart-table tbody tr[data-testid^="undefined-row-"]'
+            ).all()
+
+            for row in rows:
+                try:
+                    row_key = (
+                        row.get_attribute('data-testid') or ''
+                    ).replace('undefined-row-', '')
+                    if not row_key:
+                        continue
+
+                    # Part number
+                    pn_cell = row.locator(
+                        f'[data-testid="undefined-cell-{row_key}_itemNumber"]'
+                    )
+                    part_number = ''
+                    if pn_cell.count() > 0:
+                        pn_ps = pn_cell.locator('p.MuiTypography-body3').all()
+                        if pn_ps:
+                            part_number = pn_ps[0].inner_text().strip()
+
+                    if not part_number:
+                        continue
+
+                    # Freight Category en columna Description
+                    desc_cell = row.locator(
+                        f'[data-testid="undefined-cell-{row_key}_Description"]'
+                    )
+                    if desc_cell.count() > 0:
+                        for p_el in desc_cell.locator('p').all():
+                            try:
+                                p_text = p_el.inner_text().strip()
+                                if 'freight category' in p_text.lower() and ':' in p_text:
+                                    after = p_text.split(':', 1)[1].strip()
+                                    if after:  # Valor no vacío → LTL
+                                        ltl_pns.add(part_number)
+                                        print(f"  🚛 LTL: {part_number} | {p_text}")
+                                    break
+                            except Exception:
+                                continue
+
+                except Exception:
+                    continue
+
+            if current >= total:
+                break
+
+            next_btn = page.locator(
+                'button[aria-label="Go to next page"]:not([disabled])'
+            )
+            if next_btn.count() == 0:
+                break
+            next_btn.click()
+            time.sleep(2)
+            page.wait_for_selector('#order-review-cart-cart-table', timeout=10000)
+            time.sleep(1)
+            page_num += 1
+
+        print(f"  ✅ Scan LTL checkout completo: {len(ltl_pns)} LTL detectado(s)")
+
+    except Exception as e:
+        print(f"  ⚠️ Error en _husqvarna_checkout_ltl_scan: {e}")
+
+    finally:
+        # 5. Volver al carrito con el botón Back
+        print("  ⬅️ Volviendo al carrito (Back)...")
+        try:
+            page.evaluate("window.scrollTo(0, 0)")
+            time.sleep(0.5)
+            back_btn = page.locator('a[href="/en-us/cart"]')
+            if back_btn.count() == 0:
+                back_btn = page.locator('a:has-text("Back")')
+            if back_btn.count() > 0:
+                back_btn.first.scroll_into_view_if_needed()
+                back_btn.first.click()
+                time.sleep(3)
+                try:
+                    page.wait_for_selector(
+                        '#cart-delivery-cart-table', timeout=10000
+                    )
+                    print("  ✅ De vuelta en el carrito.")
+                except Exception:
+                    print("  ⚠️ No se pudo confirmar regreso al carrito")
+            else:
+                print("  ⚠️ Botón Back no encontrado")
+        except Exception as back_e:
+            print(f"  ⚠️ Error volviendo al carrito: {back_e}")
+
+    return ltl_pns
+
+
 def husqvarna_login_automation_playwright(
     email: str,
     password: str,
     csv_filename: str,
     requested_qtys: Optional[Dict[str, int]] = None,
+    po_number: str = "TEST001",
 ) -> Optional[List[Dict]]:
     """
     Automatización completa de Husqvarna. Flujo secuencial:
@@ -699,6 +864,19 @@ def husqvarna_login_automation_playwright(
         print("🔍 Iniciando scraping del carrito...")
         cart_data = extract_cart_table_data(page, requested_qtys)
         print(f"✅ Scraping completado. {len(cart_data)} items en carrito.")
+
+        # ── 12b. Checkout LTL scan ────────────────────────────────────────────
+        # Navega al checkout para leer 'Freight Category' en la tabla de revisión.
+        # Un valor no vacío después de ':' (ej: 'Freight Category: P1') indica LTL.
+        print("\n🔍 Scan LTL via checkout (Freight Category)...")
+        ltl_pns = _husqvarna_checkout_ltl_scan(page, po_number)
+        if ltl_pns:
+            for item in cart_data:
+                if item.get('part_number') in ltl_pns:
+                    item['ltl'] = 'Y'
+            print(f"  🚛 {len(ltl_pns)} ítem(s) marcados con ltl='Y'.")
+        else:
+            print("  ℹ️ Sin LTL detectados en checkout.")
 
         # ── 13. Limpiar el carrito ────────────────────────────────────────────
         cleanup_cart(page)

@@ -35,7 +35,6 @@ BRIGGS_BASE_URL = "https://www.powerdistributors.com/portal/dashboard"
 
 LTL_KEYWORDS = [
     'must ship via motor freight',
-    'must ship via ground service',
     'must ship via freight',
     'must ship via ltl',
     'must ship motor freight',
@@ -503,18 +502,24 @@ def _phase_1_upload_csv(
     csv_filename: str,
     requested_qtys: Dict[str, int],
     po_items: Optional[List[Dict]],
-) -> tuple:
+) -> set:
     """
-    FASE 1: Upload CSV → Build An Order → Scan rápido de LTL → Clear All.
+    FASE 1: Upload CSV en /portal/upload-order → esperar tabla completa →
+            scan LTL ahí mismo (donde los notes LTL son visibles) →
+            navegar a build-order → limpiar ítems residuales.
+
+    IMPORTANTE: el scan LTL debe hacerse en la página upload-order porque los
+    notes "Must ship via Motor Freight" sólo aparecen en esa tabla. En
+    build-order esos textos no están presentes, por eso el scan retornaba vacío.
 
     Retorna ltl_pn_set: set[str] con los part numbers (UPPER) que tienen LTL.
-    La tabla queda LIMPIA (Clear All aplicado) lista para Phase 2.
+    Deja la página en build-order con tabla limpia lista para Phase 2.
     """
     print("\n" + "="*60)
-    print("📤 FASE 1: UPLOAD CSV → DETECTAR LTL → CLEAR ALL")
+    print("📤 FASE 1: UPLOAD CSV → SCAN LTL EN UPLOAD-ORDER → BUILD-ORDER")
     print("="*60)
 
-    # ── Upload An Order ────────────────────────────────────────────────
+    # ── Navegar a Upload An Order ──────────────────────────────────────
     print("📤 Navegando a Upload An Order...")
     upload_link = page.locator('a.dashboard__subnav__link[href="/portal/upload-order"]')
     if upload_link.count() == 0:
@@ -536,19 +541,36 @@ def _phase_1_upload_csv(
     orbit = page.locator('div.pd-orbit.js--pd-orbit')
     try:
         orbit.wait_for(state='visible', timeout=10_000)
-        print("  ⏳ Overlay visible — esperando...")
+        print("  ⏳ Overlay visible — esperando procesamiento...")
     except Exception:
         print("  ℹ️  Overlay no detectado.")
     try:
         orbit.wait_for(state='hidden', timeout=90_000)
         print("  ✅ Overlay desaparecido — CSV procesado.")
     except Exception:
-        print("  ⚠️  Timeout overlay — esperando 35s...")
+        print("  ⚠️  Timeout overlay — esperando 35s adicionales...")
         time.sleep(35)
-    time.sleep(2)
 
-    # ── Ir a Build An Order para ver resultados del upload ─────────────
-    print("🛒 Navegando a Build An Order para scan LTL...")
+    # ── Esperar tabla en upload-order con tiempo prudente ─────────────
+    # Los notes LTL ("Must ship via Motor Freight") sólo aparecen en ESTA
+    # página. En build-order no están, por eso el scan debe ocurrir aquí.
+    print("\n🔍 Esperando tabla upload-order para scan LTL...")
+    ltl_pn_set: set = set()
+    try:
+        page.wait_for_selector('div.ob__results__item', timeout=30000)
+        # Tiempo prudente para que TODOS los ítems y sus notas carguen
+        time.sleep(5)
+        print("📋 Tabla upload-order lista — escaneando LTL...")
+        ltl_pn_set = _quick_ltl_scan(page)
+    except Exception as e:
+        print(f"  ⚠️  No se pudo escanear tabla upload-order: {e}")
+
+    print(f"\n🚛 LTL DETECTADOS EN UPLOAD-ORDER: {len(ltl_pn_set)}")
+    for pn in ltl_pn_set:
+        print(f"  • {pn}")
+
+    # ── Navegar a Build An Order para Fase 2 ──────────────────────────
+    print("\n🛒 Navegando a Build An Order para Fase 2...")
     build_sub = page.locator('a.dashboard__subnav__link[href="/portal/build-order"]')
     if build_sub.count() == 0:
         build_sub = page.locator('a[href="/portal/build-order"]').first
@@ -560,26 +582,19 @@ def _phase_1_upload_csv(
     build_sub.first.click()
     time.sleep(3)
 
-    # ── Esperar tabla del upload ────────────────────────────────────────
+    # ── Limpiar build-order por si quedaron ítems de sesión anterior ──
+    # (el upload a veces empuja ítems automáticamente al carrito build-order)
+    print("🗑️  Verificando y limpiando build-order antes de Fase 2...")
     try:
-        page.wait_for_selector('div.ob__results__item', timeout=30000)
+        page.wait_for_selector('div.ob__results__item', timeout=8000)
         time.sleep(1)
+        _clear_table(page)
+        time.sleep(1.5)
+        print("  ✅ Build-order limpio.")
     except Exception:
-        print("  ℹ️  No hay filas en tabla tras el upload.")
-        return set()
+        print("  ℹ️  No hay ítems en build-order — tabla ya limpia.")
 
-    # ── Scan rápido: solo detectar LTL ─────────────────────────────────
-    ltl_pn_set = _quick_ltl_scan(page)
-    print(f"\n🚛 LTL DETECTADOS EN FASE 1: {len(ltl_pn_set)}")
-    for pn in ltl_pn_set:
-        print(f"  • {pn}")
-
-    # ── Clear All: limpiar tabla antes de Phase 2 ───────────────────────
-    print("\n🗑️  Clear All (Phase 1 finaliza con tabla limpia)...")
-    _clear_table(page)
-    time.sleep(1)
-    print("✅ Tabla limpia. Lista para Phase 2.")
-
+    print("✅ Fase 1 completa. Build-order listo para Fase 2.")
     return ltl_pn_set
 
 
