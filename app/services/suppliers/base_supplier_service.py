@@ -353,8 +353,9 @@ class SupplierService(ABC):
 
             # 5. Enriquecer items con po_number, supplier_code, mfrid_orig, partnumber_orig
             # mfrid_orig viene en el body (po_data.products) → crear mapa y asignar a cada item
+            # Fallback: si mfrid_orig no viene en el body, usar mfrid (ej: 'HUS')
             mfrid_orig_map = {
-                p.partNumber: (p.mfrid_orig or '')
+                p.partNumber: (p.mfrid_orig or p.mfrid or '')
                 for p in po_data.products
             }
 

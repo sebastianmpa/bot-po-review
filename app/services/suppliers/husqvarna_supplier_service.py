@@ -108,8 +108,10 @@ class HusqvarnaSupplierService(SupplierService):
         if po_data is not None:
             requested_qtys = {p.partNumber: p.qty for p in po_data.products}
 
+        po_number = po_data.poNumber if po_data else "TEST001"
         return husqvarna_login_automation_playwright(
-            email, password, csv_filename, requested_qtys
+            email, password, csv_filename, requested_qtys,
+            po_number=po_number,
         )
 
     # ------------------------------------------------------------------ #

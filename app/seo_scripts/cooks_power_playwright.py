@@ -412,21 +412,28 @@ def process_item(
                 break  # Salir del loop; selected_option apunta al reemplazo
 
             # ── Versión PACK (sufijo "X") ────────────────────────────────────
+            # Solo se registra como pack_match; pack_qty se asigna SOLO si
+            # al final se elige la variante pack (no hay coincidencia exacta).
             if (sku.upper() == part_number.upper() + "X" or
                   (sku.upper().startswith(part_number.upper()) and sku.upper().endswith("X"))):
                 pack_match = opt
                 pack_match_sku = sku
-                # Intentar extraer cantidad del pack del nombre
-                pm = re.search(r"(?:pack\s+of|pack)\s*(\d+)", item_name, re.IGNORECASE)
-                result["pack_qty"] = int(pm.group(1)) if pm else 1
+                # Guardar la qty del pack en una variable temporal (NO en result todavía)
+                pm = re.search(r"(\d+)\s*[Pp][Kk]|(?:pack\s+of|pack)\s*(\d+)", item_name, re.IGNORECASE)
+                if pm:
+                    _pack_qty_temp = int(pm.group(1) or pm.group(2))
+                else:
+                    _pack_qty_temp = 1
 
         # ── Decidir qué opción usar si no fue SUPERSEDED ────────────────────
         if selected_option is None:
             if exact_match:
+                # Coincidencia exacta → usar el SKU normal, pack_qty queda None
                 selected_option = exact_match
                 _, selected_sku = _get_option_info(exact_match)
+                result["pack_qty"] = None  # NO somos el pack aunque exista 793828X
                 if pack_match:
-                    print(f"  📦 Versión pack disponible como alternativa (pack_qty={result['pack_qty']})")
+                    print(f"  📦 Versión pack disponible como alternativa (ignorada, usamos SKU exacto)")
             elif nla_option:
                 # Coincidencia exacta pero tiene NLA
                 print(f"  ❌ NLA detectado: {part_number} — limpiando input y continuando.")
@@ -441,9 +448,10 @@ def process_item(
                 recover_from_cms_redirect(page)
                 return result
             elif pack_match:
-                # Solo existe versión pack
+                # Solo existe versión pack (no hay SKU exacto) → usar el pack y registrar qty
                 selected_option = pack_match
                 selected_sku = pack_match_sku
+                result["pack_qty"] = _pack_qty_temp
                 print(f"  📦 PACK (única versión disponible): '{selected_sku}' pack_qty={result['pack_qty']}")
             elif options:
                 # Fallback: primera opción

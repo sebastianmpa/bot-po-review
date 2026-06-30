@@ -835,30 +835,28 @@ def husqvarna_login_automation_playwright(
             return None
         add_to_cart_btn.first.scroll_into_view_if_needed()
         add_to_cart_btn.first.click()
-        time.sleep(5)
         print("✅ Items agregados al carrito.")
 
-        # ── 11. Click 'Go to cart' ────────────────────────────────────────────
-        print("🛒 Haciendo clic en 'Go to cart'...")
-        go_to_cart_btn = page.locator('button:has-text("Go to cart")')
-        # Si no está visible, hacer scroll hasta el fondo para que aparezca
-        if go_to_cart_btn.count() == 0 or not go_to_cart_btn.first.is_visible():
-            print("⬇️ Scroll hasta el final para encontrar 'Go to cart'...")
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(1)
-            # Reintentar hasta 5 veces scrolleando de a tramos
-            for _ in range(5):
-                if go_to_cart_btn.count() > 0 and go_to_cart_btn.first.is_visible():
-                    break
-                page.evaluate("window.scrollBy(0, 600)")
-                time.sleep(0.5)
-        if go_to_cart_btn.count() == 0:
-            print("❌ Botón 'Go to cart' no encontrado")
-            return None
-        go_to_cart_btn.first.scroll_into_view_if_needed()
-        go_to_cart_btn.first.click()
-        time.sleep(7)
-        print("✅ Navegando al carrito.")
+        # ── 11. Navegar al carrito ────────────────────────────────────────────
+        # El toast "Go to cart" aparece brevemente tras el click y puede
+        # desaparecer antes de que lo encontremos con un sleep largo.
+        # Estrategia: intentar capturarlo en los primeros 4s; si no, ir directo.
+        print("🛒 Navegando al carrito...")
+        go_to_cart_btn = page.locator(
+            'button:has-text("Go to cart"), a:has-text("Go to cart"), '
+            'button:has-text("View cart"), a:has-text("View cart")'
+        )
+        try:
+            go_to_cart_btn.first.wait_for(state="visible", timeout=4000)
+            go_to_cart_btn.first.click()
+            time.sleep(5)
+            print("✅ Navegando al carrito via botón toast.")
+        except Exception:
+            # Toast ya desapareció o nunca apareció → navegar directo por URL
+            print("⚠️ Toast 'Go to cart' no disponible → navegando directo a /en-us/cart")
+            page.goto("https://power.husqvarnagroup.com/en-us/cart", wait_until="networkidle")
+            time.sleep(3)
+            print("✅ Navegando al carrito via URL directa.")
 
         # ── 12. Scraping del carrito ──────────────────────────────────────────
         print("🔍 Iniciando scraping del carrito...")
@@ -930,7 +928,7 @@ def husqvarna_login_automation_playwright(
 if __name__ == "__main__":
     EMAIL = "danielam.prontomowers@gmail.com"
     PASSWORD = "Chainsaw01"
-    CSV_FILENAME = "husq-test.csv"
+    CSV_FILENAME = "PO_93856_HU_20260629_072400.csv"
 
     result = husqvarna_login_automation_playwright(EMAIL, PASSWORD, CSV_FILENAME)
 
