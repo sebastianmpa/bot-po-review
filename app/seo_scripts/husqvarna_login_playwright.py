@@ -1,5 +1,6 @@
 from playwright.sync_api import sync_playwright, Page
 from pynput.keyboard import Key, Controller
+import re
 import time
 import os
 from typing import List, Dict, Optional, Tuple
@@ -160,6 +161,7 @@ def _scrape_cart_page(page: Page, requested_qtys: Dict[str, int], results: List[
             item_status = 'CORRECT'
             item_error_message = None
             nla = None
+            item_ltl = None
             try:
                 pn_cell = row.locator(f'[data-testid="undefined-cell-{row_key}_itemNumber"]')
                 if pn_cell.count() > 0:
@@ -203,6 +205,22 @@ def _scrape_cart_page(page: Page, requested_qtys: Dict[str, int], results: List[
                             item_status = 'PART_ERROR'
                             item_error_message = f"No Longer Available: {part_number}"
                             print(f"    \U0001f6ab NLA: {part_number}")
+
+                    # Detectar LTL directo en carrito: "Freight Category: X" o "Freight Category=X"
+                    # (cualquier valor no vacío tras el separador : o = indica LTL)
+                    for p_el in desc_cell.locator('p').all():
+                        try:
+                            p_text = p_el.inner_text().strip()
+                            m = re.search(
+                                r'freight\s+category\s*[:=]\s*(\S+)',
+                                p_text, re.IGNORECASE
+                            )
+                            if m and m.group(1).strip():
+                                item_ltl = 'Y'
+                                print(f"    \U0001f69b LTL (carrito): {part_number} | {p_text}")
+                                break
+                        except Exception:
+                            continue
             except Exception:
                 pass
 
@@ -301,7 +319,7 @@ def _scrape_cart_page(page: Page, requested_qtys: Dict[str, int], results: List[
                 'error_message': item_error_message,
                 'nla': nla,
                 'superseded_from': superseded_from,
-                'ltl': None,
+                'ltl': item_ltl,
             })
             print(
                 f"    ✓ [{base_idx + idx}] {part_number} | "
@@ -586,11 +604,13 @@ def _husqvarna_checkout_ltl_scan(page: Page, po_number: str) -> set:
                         for p_el in desc_cell.locator('p').all():
                             try:
                                 p_text = p_el.inner_text().strip()
-                                if 'freight category' in p_text.lower() and ':' in p_text:
-                                    after = p_text.split(':', 1)[1].strip()
-                                    if after:  # Valor no vacío → LTL
-                                        ltl_pns.add(part_number)
-                                        print(f"  🚛 LTL: {part_number} | {p_text}")
+                                m = re.search(
+                                    r'freight\s+category\s*[:=]\s*(\S+)',
+                                    p_text, re.IGNORECASE
+                                )
+                                if m and m.group(1).strip():  # Valor no vacío → LTL
+                                    ltl_pns.add(part_number)
+                                    print(f"  🚛 LTL (checkout): {part_number} | {p_text}")
                                     break
                             except Exception:
                                 continue
@@ -928,7 +948,7 @@ def husqvarna_login_automation_playwright(
 if __name__ == "__main__":
     EMAIL = "danielam.prontomowers@gmail.com"
     PASSWORD = "Chainsaw01"
-    CSV_FILENAME = "PO_93856_HU_20260629_072400.csv"
+    CSV_FILENAME = "PO_93913_HU_20260701_025558.csv"
 
     result = husqvarna_login_automation_playwright(EMAIL, PASSWORD, CSV_FILENAME)
 

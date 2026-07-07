@@ -378,6 +378,14 @@ class SupplierService(ABC):
                 else:
                     item['partnumber_orig'] = item.get('partnumber_orig') or part
 
+            # 5.5 Enriquecer LTL desde BD shipping_ltl (aplica a TODOS los proveedores)
+            from seo_scripts.insert_data_in_db import enrich_ltl_from_db
+            ltl_marked = enrich_ltl_from_db(scraped_data)
+            if ltl_marked:
+                print(f"  🚛 {ltl_marked} ítem(s) marcados ltl='Y' desde shipping_ltl BD.")
+            else:
+                print("  ℹ️  Sin LTL en shipping_ltl BD para esta PO.")
+
             # 6. Procesar resultados (lógica específica del proveedor)
             response_products = self.process_results(scraped_data, po_data)
 

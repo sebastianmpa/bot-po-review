@@ -191,6 +191,86 @@ def fetch_pack_codes_for_po(po_products) -> Dict[tuple, List[Dict]]:
     return pack_map
 
 
+def enrich_ltl_from_db(scraped_data: List[Dict]) -> int:
+    """
+    Post-scraping: busca cada ítem en prontoweb.shipping_ltl por (mfrid, partnumber).
+    Si hay match, marca ltl='Y' en el item del scraped_data.
+    No sobreescribe si ltl ya está en 'Y' (ej: Husqvarna detectó LTL via checkout).
+    Aplica a TODOS los proveedores.
+    Retorna el número de ítems marcados en este paso.
+
+    Mapa de normalización de mfrid hacia los valores usados en shipping_ltl:
+      BRS → BS   (Briggs & Stratton: el scraping devuelve 'BRS' pero la tabla usa 'BS')
+    """
+    if not scraped_data:
+        return 0
+
+    # mfrid que llega del scraping → mfrid real en shipping_ltl
+    MFRID_NORMALIZE = {
+        'BRS': 'BS',
+    }
+
+    marked = 0
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(dictionary=True)
+
+        # Recopilar pares (mfrid_normalizado, partnumber) únicos con datos válidos
+        # Guardamos también un mapa de vuelta para poder hacer el match contra scraped_data
+        # item_mfrid_up → mfrid_ltl_up  (para el lookup del set de resultados)
+        pairs = []
+        for item in scraped_data:
+            raw_mfrid = (item.get('mfrid') or '').strip()
+            pn        = (item.get('part_number') or '').strip()
+            if raw_mfrid and pn:
+                # Normalizar hacia el valor que usa shipping_ltl
+                ltl_mfrid = MFRID_NORMALIZE.get(raw_mfrid.upper(), raw_mfrid)
+                pairs.append((ltl_mfrid, pn))
+
+        if not pairs:
+            cur.close()
+            conn.close()
+            return 0
+
+        # Una sola query batch para todos los pares
+        conditions = ' OR '.join(['(mfrid = %s AND partnumber = %s)'] * len(pairs))
+        params     = [val for pair in pairs for val in pair]
+        query = f"""
+            SELECT mfrid, partnumber
+            FROM prontoweb.shipping_ltl
+            WHERE {conditions}
+        """
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not rows:
+            return 0
+
+        # Set de tuplas upper para lookup O(1)
+        ltl_set = {(r['mfrid'].upper(), r['partnumber'].upper()) for r in rows}
+
+        for item in scraped_data:
+            raw_mfrid = (item.get('mfrid') or '').strip()
+            pn_up     = (item.get('part_number') or '').strip().upper()
+            # Normalizar mfrid igual que hicimos para la query
+            ltl_mfrid_up = MFRID_NORMALIZE.get(raw_mfrid.upper(), raw_mfrid).upper()
+            if (ltl_mfrid_up, pn_up) in ltl_set:
+                if item.get('ltl') != 'Y':
+                    item['ltl'] = 'Y'
+                    marked += 1
+                    logger.info(
+                        f"🚛 LTL desde BD shipping_ltl: "
+                        f"{raw_mfrid}(→{ltl_mfrid_up})/{item.get('part_number')}"
+                    )
+
+    except Exception as e:
+        logger.warning(f"⚠️ enrich_ltl_from_db falló: {e}")
+
+    return marked
+
+
 def insert_po_review_details(scraped_data: List[Dict]) -> int:
     """
     Inserta los datos de scraping en la tabla po_review_details.
