@@ -294,11 +294,28 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
         connection = get_db_connection()
         cursor = connection.cursor()
         
-        # Query de inserción
+        # Query de inserción — ON DUPLICATE KEY UPDATE para tolerar re-ejecuciones
         insert_query = """
         INSERT INTO po_review_details 
         (po_number, mfrid, mfrid_orig, part_number, partnumber_orig, qty, ideal_cost, supplier_price, available_qty, in_stock, status, error_message, superseded_from, nla, pack_qty, ltl, supplier_code, pack_codes, crossover)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            mfrid_orig      = VALUES(mfrid_orig),
+            partnumber_orig = VALUES(partnumber_orig),
+            qty             = VALUES(qty),
+            ideal_cost      = VALUES(ideal_cost),
+            supplier_price  = VALUES(supplier_price),
+            available_qty   = VALUES(available_qty),
+            in_stock        = VALUES(in_stock),
+            status          = VALUES(status),
+            error_message   = VALUES(error_message),
+            superseded_from = VALUES(superseded_from),
+            nla             = VALUES(nla),
+            pack_qty        = VALUES(pack_qty),
+            ltl             = VALUES(ltl),
+            supplier_code   = VALUES(supplier_code),
+            pack_codes      = VALUES(pack_codes),
+            crossover       = VALUES(crossover)
         """
         
         # Insertar cada fila

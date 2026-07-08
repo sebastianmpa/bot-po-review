@@ -149,6 +149,148 @@ class FloridaOutdoorSupplierService(SupplierService):
                 for p in po_data.products
             ] + extra_dict_items
 
+            # ── Mapas de enriquecimiento (construidos ANTES del scraping) ─────
+            ideal_costs: Dict[str, float] = {p.partNumber: p.idealCost for p in po_data.products}
+            mfrid_map:   Dict[str, str]   = {p.partNumber: p.mfrid for p in po_data.products}
+            mfrid_orig_map: Dict[str, str] = {
+                p.partNumber: (p.mfrid_orig or p.mfrid or '') for p in po_data.products
+            }
+
+            # ── Pre-fetch LTL: una sola query batch ANTES del scraping ───────
+            # Consultamos shipping_ltl para todos los po_items conocidos y
+            # construimos un set de PNs con LTL que el callback usará en O(1).
+            ltl_check = [
+                {'mfrid': it.get('mfrid', ''), 'part_number': it.get('part_number', '')}
+                for it in po_items if it.get('part_number')
+            ]
+            enrich_ltl_from_db(ltl_check)
+            ltl_pns_set = {it['part_number'].upper() for it in ltl_check if it.get('ltl') == 'Y'}
+            if ltl_pns_set:
+                print(f"  🚛 {len(ltl_pns_set)} ítem(s) con LTL pre-fetched desde shipping_ltl.")
+            else:
+                print("  ℹ️  Sin LTL en shipping_ltl para esta PO.")
+
+            total_items = len(po_data.products)
+            item_counter = [0]   # lista mutable — permite mutación desde la closure
+            response_products: List[PurchaseOrderResponseProduct] = []
+
+            # ── Callback: invocado por cada ítem en cuanto su stock es scrapeado
+            def on_item_ready(item: dict) -> None:
+                part = item.get('part_number', '')
+                if not part:
+                    return
+                # Saltar ítems de pack (consultas de precio auxiliares, no PO reales)
+                if part.upper() in pack_lookup_index:
+                    return
+
+                item_counter[0] += 1
+                i = item_counter[0]
+
+                # Enriquecer metadata
+                item['po_number']     = po_data.poNumber
+                item['supplier_code'] = po_data.supplerID
+                if not item.get('mfrid'):
+                    item['mfrid'] = mfrid_map.get(part, '')
+                item['mfrid_orig'] = item.get('mfrid_orig') or mfrid_orig_map.get(part, '')
+                if item.get('status') == 'SUPERSEDED' and item.get('superseded_from'):
+                    item['partnumber_orig'] = item['superseded_from']
+                else:
+                    item['partnumber_orig'] = item.get('partnumber_orig') or part
+                item['ideal_cost'] = ideal_costs.get(part, 0.0)
+
+                # LTL desde pre-fetched set (O(1), sin query adicional por ítem)
+                if not item.get('ltl') and part.upper() in ltl_pns_set:
+                    item['ltl'] = 'Y'
+
+                # Comparación de precios
+                your_price      = item.get('your_price')
+                price_float     = float(your_price) if your_price is not None else 0.0
+                ideal_cost_v    = item.get('ideal_cost', 0.0)
+                pre_status      = item.get('status', 'CORRECT')
+                err_msg         = item.get('error_message')
+                pack_qty        = item.get('pack_qty')
+                ltl             = item.get('ltl')
+                superseded_from = item.get('superseded_from')
+                cart_qty        = item.get('qty', 0)
+
+                if pre_status == 'PART_ERROR' and price_float == 0.0:
+                    status = 'PART_ERROR'
+                    print(f"  [{i}/{total_items}] ❌ PART_ERROR [{part}]: {err_msg}")
+                elif pre_status == 'SUPERSEDED':
+                    status = 'SUPERSEDED'
+                    print(f"  [{i}/{total_items}] 🔄 SUPERSEDED [{part}] ← {superseded_from}")
+                elif price_float == 0.0:
+                    status = 'CORRECT'
+                    print(f"  [{i}/{total_items}] ⏳ SIN PRECIO: {part}")
+                elif price_float > 0 and ideal_cost_v > 0:
+                    difference = abs(ideal_cost_v - price_float)
+                    tolerance  = ideal_cost_v * 0.01
+                    print(
+                        f"  [{i}/{total_items}] 💵 [{part}] "
+                        f"Ideal=${ideal_cost_v:.2f} | FOE=${price_float:.2f} | "
+                        f"Diff=${difference:.2f} | Tol=${tolerance:.2f}"
+                    )
+                    if difference > tolerance:
+                        status = 'MISMATCH'
+                        err_msg = (
+                            f"Price mismatch: Expected ${ideal_cost_v:.2f}, FOE ${price_float:.2f}"
+                        )
+                        if pack_qty:
+                            err_msg += f" (Pack item — min qty: {pack_qty})"
+                        print(f"  [{i}/{total_items}] ❌ MISMATCH")
+                    else:
+                        status = 'CORRECT'
+                        notes = []
+                        if pack_qty:
+                            notes.append(f"Pack item — min qty: {pack_qty}")
+                        if ltl:
+                            notes.append("LTL shipment required")
+                        err_msg = " | ".join(notes) if notes else None
+                        print(f"  [{i}/{total_items}] ✅ CORRECT")
+                else:
+                    status = 'CORRECT'
+
+                item['status']        = status
+                item['error_message'] = err_msg
+
+                final_mfrid = item.get('mfrid') or mfrid_map.get(part, '')
+                product = PurchaseOrderResponseProduct(
+                    mfrid=final_mfrid,
+                    partNumber=part,
+                    qty=cart_qty,
+                    idealCost=ideal_cost_v if ideal_cost_v > 0 else 0.0,
+                    supplierPrice=price_float,
+                    status=status,
+                    nla=item.get('nla'),
+                    supersededFrom=superseded_from,
+                    packQty=pack_qty,
+                    ltl=ltl,
+                )
+                response_products.append(product)
+
+                # 1. Insertar en BD inmediatamente
+                try:
+                    insert_po_review_details([item])
+                    print(f"  [{i}/{total_items}] 💾 BD: {part}")
+                except Exception as db_err:
+                    print(f"  [{i}/{total_items}] ⚠️ Error BD [{part}]: {db_err}")
+
+                # 2. Enviar chunk progress inmediatamente
+                try:
+                    register_chunk_item({
+                        "chunkId": chunk_id,
+                        "item": {
+                            "poNumber":  po_data.poNumber,
+                            "supplerID": po_data.supplerID,
+                            "products":  [product.dict()],
+                        },
+                        "status": "Success",
+                    })
+                    print(f"  [{i}/{total_items}] 📤 Chunk: {part}")
+                except Exception as chunk_err:
+                    print(f"  [{i}/{total_items}] ⚠️ Error chunk [{part}]: {chunk_err}")
+
+            # ── Ejecutar automatización — el callback se invoca por cada ítem ──
             print(f"🤖 Ejecutando automatización [{self.supplier_name}]...")
             scraped_data = self.run_automation(
                 email=credentials["email"],
@@ -156,6 +298,7 @@ class FloridaOutdoorSupplierService(SupplierService):
                 csv_filename="",
                 po_data=po_data,
                 po_items=po_items,
+                on_item_ready=on_item_ready,
             )
 
             if not scraped_data:
@@ -164,138 +307,11 @@ class FloridaOutdoorSupplierService(SupplierService):
                     f"para PO {po_data.poNumber}"
                 )
 
-            print(f"✅ Automatización completada. {len(scraped_data)} filas extraídas.")
-
-            # Extraer costos de packs y limpiar scraped_data
+            # Pack cost extraction (extrae precios de ítems auxiliares de pack)
             if pack_lookup_index:
                 scraped_data = self._apply_pack_costs_and_clean(
                     scraped_data, pack_map, pack_lookup_index
                 )
-
-            # ── Mapas de enriquecimiento (construidos una sola vez) ────────────
-            ideal_costs: Dict[str, float] = {p.partNumber: p.idealCost for p in po_data.products}
-            mfrid_map:   Dict[str, str]   = {p.partNumber: p.mfrid for p in po_data.products}
-            mfrid_orig_map: Dict[str, str] = {
-                p.partNumber: (p.mfrid_orig or p.mfrid or '') for p in po_data.products
-            }
-
-            # ── Pre-enriquecer metadatos comunes en todos los ítems ───────────
-            for item in scraped_data:
-                part = item.get("part_number", "")
-                item["po_number"]     = po_data.poNumber
-                item["supplier_code"] = po_data.supplerID
-                if not item.get("mfrid"):
-                    item["mfrid"] = mfrid_map.get(part, "")
-                item["mfrid_orig"] = item.get("mfrid_orig") or mfrid_orig_map.get(part, "")
-                if item.get("status") == "SUPERSEDED" and item.get("superseded_from"):
-                    item["partnumber_orig"] = item["superseded_from"]
-                else:
-                    item["partnumber_orig"] = item.get("partnumber_orig") or part
-                item["ideal_cost"] = ideal_costs.get(part, 0.0)
-
-            # ── LTL desde BD en batch (una sola query para toda la PO) ────────
-            ltl_marked = enrich_ltl_from_db(scraped_data)
-            if ltl_marked:
-                print(f"  🚛 {ltl_marked} ítem(s) marcados ltl='Y' desde shipping_ltl BD.")
-            else:
-                print("  ℹ️  Sin LTL en shipping_ltl BD para esta PO.")
-
-            # ── Procesar, insertar y enviar chunk ÍTEM A ÍTEM ─────────────────
-            print(f"\n📦 Procesando {len(scraped_data)} ítem(s) individualmente...")
-            response_products: List[PurchaseOrderResponseProduct] = []
-
-            for i, item in enumerate(scraped_data, 1):
-                part_number          = item.get("part_number", "")
-                your_price: Optional[Decimal] = item.get("your_price")
-                pre_status: str      = item.get("status", "CORRECT")
-                error_message: Optional[str]  = item.get("error_message")
-                pack_qty: Optional[int]       = item.get("pack_qty")
-                nla: Optional[str]            = item.get("nla")
-                ltl: Optional[str]            = item.get("ltl")
-                superseded_from: Optional[str]= item.get("superseded_from")
-                cart_qty: int        = item.get("qty", 0)
-                ideal_cost           = item.get("ideal_cost", 0.0)
-                price_float          = float(your_price) if your_price is not None else 0.0
-
-                # ── Comparación de precios ─────────────────────────────────
-                if pre_status == "PART_ERROR" and price_float == 0.0:
-                    status = "PART_ERROR"
-                    print(f"  [{i}/{len(scraped_data)}] ❌ PART_ERROR [{part_number}]: {error_message}")
-
-                elif pre_status == "SUPERSEDED":
-                    status = "SUPERSEDED"
-                    print(f"  [{i}/{len(scraped_data)}] 🔄 SUPERSEDED [{part_number}] ← {superseded_from}")
-
-                elif price_float == 0.0:
-                    status = "CORRECT"
-                    print(f"  [{i}/{len(scraped_data)}] ⏳ SIN PRECIO: {part_number}")
-
-                elif price_float > 0 and ideal_cost > 0:
-                    difference = abs(ideal_cost - price_float)
-                    tolerance  = ideal_cost * 0.01
-                    print(
-                        f"  [{i}/{len(scraped_data)}] 💵 [{part_number}] "
-                        f"Ideal=${ideal_cost:.2f} | FOE=${price_float:.2f} | "
-                        f"Diff=${difference:.2f} | Tol=${tolerance:.2f}"
-                    )
-                    if difference > tolerance:
-                        status = "MISMATCH"
-                        error_message = (
-                            f"Price mismatch: Expected ${ideal_cost:.2f}, FOE ${price_float:.2f}"
-                        )
-                        if pack_qty:
-                            error_message += f" (Pack item — min qty: {pack_qty})"
-                        print(f"  [{i}/{len(scraped_data)}] ❌ MISMATCH")
-                    else:
-                        status = "CORRECT"
-                        notes = []
-                        if pack_qty:
-                            notes.append(f"Pack item — min qty: {pack_qty}")
-                        if ltl:
-                            notes.append("LTL shipment required")
-                        error_message = " | ".join(notes) if notes else None
-                        print(f"  [{i}/{len(scraped_data)}] ✅ CORRECT")
-                else:
-                    status = "CORRECT"
-
-                item["status"] = status
-
-                final_mfrid = item.get("mfrid") or mfrid_map.get(part_number, "")
-                product = PurchaseOrderResponseProduct(
-                    mfrid=final_mfrid,
-                    partNumber=part_number,
-                    qty=cart_qty,
-                    idealCost=ideal_cost if ideal_cost > 0 else 0.0,
-                    supplierPrice=price_float,
-                    status=status,
-                    nla=nla,
-                    supersededFrom=superseded_from,
-                    packQty=pack_qty,
-                    ltl=ltl,
-                )
-                response_products.append(product)
-
-                # ── 1. Insertar este ítem en BD ────────────────────────────
-                try:
-                    insert_po_review_details([item])
-                    print(f"  [{i}/{len(scraped_data)}] 💾 BD: {part_number}")
-                except Exception as db_err:
-                    print(f"  [{i}/{len(scraped_data)}] ⚠️ Error BD [{part_number}]: {db_err}")
-
-                # ── 2. Enviar chunk progress para este ítem ────────────────
-                try:
-                    register_chunk_item({
-                        "chunkId": chunk_id,
-                        "item": [{
-                            "poNumber":  po_data.poNumber,
-                            "supplerID": po_data.supplerID,
-                            "products":  [product.dict()],
-                        }],
-                        "status": "Success",
-                    })
-                    print(f"  [{i}/{len(scraped_data)}] 📤 Chunk enviado: {part_number}")
-                except Exception as chunk_err:
-                    print(f"  [{i}/{len(scraped_data)}] ⚠️ Error chunk [{part_number}]: {chunk_err}")
 
             self._print_summary(response_products)
             return PurchaseOrderResponseData(
@@ -319,6 +335,7 @@ class FloridaOutdoorSupplierService(SupplierService):
         csv_filename: str,
         po_data: Optional[PurchaseOrderDataModel] = None,
         po_items: Optional[List[Dict]] = None,
+        on_item_ready=None,
         **kwargs,
     ) -> Optional[List[Dict]]:
         items = po_items or []
@@ -336,6 +353,7 @@ class FloridaOutdoorSupplierService(SupplierService):
             username=email,
             password=password,
             po_items=items,
+            on_item_ready=on_item_ready,
         )
 
     # ------------------------------------------------------------------ #

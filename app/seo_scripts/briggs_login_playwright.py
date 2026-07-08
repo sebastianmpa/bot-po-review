@@ -173,6 +173,7 @@ def extract_table_data(page: Page, requested_qtys: Dict[str, int]) -> List[Dict]
 
                 # ── Description, NLA, SUPERSEDED, LTL, Package Notes ─────────
                 description = ''
+                portal_mfrid_in_desc = ''  # mfrid que aparece en la descripción del portal
                 nla = None
                 superseded_from = None
                 ltl = None
@@ -192,24 +193,59 @@ def extract_table_data(page: Page, requested_qtys: Dict[str, int]) -> List[Dict]
                         desc_ps = desc_cell.locator('p.ob__results__text').all()
                         if desc_ps:
                             description = desc_ps[0].inner_text().strip()
+                            # Extraer portal_mfrid del encabezado de la primera <p>:
+                            # "BS, 4156 GASKET (5 X 795629)"  → 'BS'
+                            # "NGK, 4156 R0161-9 SPARK PLUG" → 'NGK'
+                            pm_match = re.match(r'^([A-Za-z]+),\s*\S+', description)
+                            if pm_match:
+                                portal_mfrid_in_desc = pm_match.group(1).upper()
 
                         # NLA — SOLO desde el texto de descripción.
                         # NO usar availability == 'UNAVAILABLE' porque si la
                         # detección del ícono falla por timing, se producirían
                         # falsos NLA en partes que sí tienen stock y precio.
-                        if 'this item is not available' in full_text_lower:
+                        # Frases que el portal Briggs usa para indicar no disponible:
+                        #   "This item is No Longer Available"  (Availability Notes)
+                        #   "This item is not available"        (Warning)
+                        #   "This item is Discontinued"         (desc + backordered)
+                        _NLA_PHRASES = (
+                            'this item is not available',
+                            'is no longer available',
+                            'this item is discontinued',
+                            'no longer available',
+                        )
+                        if any(phrase in full_text_lower for phrase in _NLA_PHRASES):
                             nla = 'Y'
                             item_status = 'PART_ERROR'
                             item_error_message = f"No Longer Available: {part_number}"
                             print(f"  🚫 NLA: {part_number}")
 
-                        # SUPERSEDED
-                        if 'part superseded from' in full_text_lower:
+                        # SUPERSEDED — dos formatos posibles del portal Briggs:
+                        # 1) "Part Superseded From: OLD_PART"   (formato antiguo)
+                        # 2) "Supersedes from MFRID, OLD_PART"  (Part Notes moderno)
+                        #    Ej: "Supersedes from BS, 594201" → superseded_from='594201'
+                        if 'part superseded from' in full_text_lower or 'supersedes from' in full_text_lower:
                             for line in full_text.splitlines():
-                                if 'part superseded from' in line.lower():
+                                line_lower = line.lower()
+                                if 'part superseded from' in line_lower:
                                     after = line.split(':', 1)[-1].strip() if ':' in line else ''
                                     if after:
                                         superseded_from = after
+                                    break
+                                elif 'supersedes from' in line_lower:
+                                    # "Supersedes from BS, 594201" → extraer solo "594201"
+                                    m = re.search(
+                                        r'supersedes\s+from\s+\S+,\s*(\S+)',
+                                        line, re.IGNORECASE
+                                    )
+                                    if m:
+                                        superseded_from = m.group(1).strip()
+                                    else:
+                                        # fallback: texto tras "supersedes from "
+                                        parts = re.split(r'supersedes\s+from\s+', line, flags=re.IGNORECASE, maxsplit=1)
+                                        if len(parts) > 1:
+                                            raw = parts[1].strip()
+                                            superseded_from = raw.split(',', 1)[-1].strip() if ',' in raw else raw
                                     break
                             if superseded_from:
                                 item_status = 'SUPERSEDED'
@@ -303,6 +339,7 @@ def extract_table_data(page: Page, requested_qtys: Dict[str, int]) -> List[Dict]
                 stock_icon = '✅' if in_stock == 'Y' else '❌'
                 results.append({
                     'mfrid': '',
+                    'portal_mfrid': portal_mfrid_in_desc,
                     'part_number': part_number,
                     'description': description,
                     'availability': availability,
@@ -675,9 +712,13 @@ def _phase_2_item_by_item(
                     part_errors[(mfr_up, pn_upper)] = _make_part_error(it, req_qty, ltl=is_ltl)
                 continue
 
-            # Recolectar todos los mfrid disponibles en el dropdown para este pn
+            # Recolectar todos los mfrid disponibles en el dropdown para este pn.
+            # target_mfrid_card: primera tarjeta cuyo mfrid coincide con los mfrids
+            # requeridos por la PO.  Preferirla sobre first_valid_card evita añadir
+            # el ítem bajo un mfrid diferente al solicitado (ej. OCS en vez de BS).
             available_portal_mfrids: set = set()
             first_valid_card = None
+            target_mfrid_card = None   # tarjeta que coincide con mfrid requerido
             cards = page.locator('div.ob__searchcard')
             for card in cards.all():
                 try:
@@ -689,6 +730,9 @@ def _phase_2_item_by_item(
                             available_portal_mfrids.add(card_mfr)
                             if first_valid_card is None:
                                 first_valid_card = card
+                            # Preferir la tarjeta que coincide con un mfrid requerido
+                            if target_mfrid_card is None and card_mfr in required:
+                                target_mfrid_card = card
                 except Exception:
                     continue
 
@@ -716,8 +760,11 @@ def _phase_2_item_by_item(
                 search_input.fill('')
                 continue
 
-            # Añadir al carrito UNA sola vez
-            first_valid_card.click()
+            # Añadir al carrito UNA sola vez.
+            # Preferir la tarjeta que coincide con el mfrid solicitado; si el
+            # portal no tiene esa combinación exacta, usar la primera encontrada.
+            card_to_click = target_mfrid_card or first_valid_card
+            card_to_click.click()
             time.sleep(0.5)
             qty_input = page.locator('#qty')
             qty_input.wait_for(state='visible', timeout=3000)
@@ -755,12 +802,16 @@ def _phase_2_item_by_item(
         except Exception as e:
             print(f"  ⚠️  Error en scrape final: {e}")
 
-    # Índices por pn (primera ocurrencia) y por superseded_from
+    # Índices por pn (primera ocurrencia), por (portal_mfrid, pn) y por superseded_from
     scraped_by_pn: Dict[str, Dict] = {}
+    scraped_by_mfrid_pn: Dict[tuple, Dict] = {}
     for r in scraped_rows:
         pn_up = r['part_number'].upper()
+        pmfr  = (r.get('portal_mfrid') or '').upper()
         if pn_up not in scraped_by_pn:
             scraped_by_pn[pn_up] = r
+        if pmfr and (pmfr, pn_up) not in scraped_by_mfrid_pn:
+            scraped_by_mfrid_pn[(pmfr, pn_up)] = r
 
     scraped_by_superseded: Dict[str, Dict] = {}
     for r in scraped_rows:
@@ -770,11 +821,12 @@ def _phase_2_item_by_item(
 
     # ── Reconciliar: cada (mfrid, pn) → su propio resultado ────────────────
     # Prioridad (POR COMBINACIÓN mfrid+pn):
-    #   1. err_key in part_errors  → este mfrid específico NO existe en portal → PART_ERROR
-    #                                 (ej: OCS,392-133 → PART_ERROR aunque OEP sí exista)
-    #   2. pn_up in scraped_by_pn  → este mfrid SÍ existe en portal → usar precio scrapeado
-    #   3. scraped_by_superseded   → pn fue supersedido
-    #   4. fallback                → _make_part_error
+    #   1. err_key in part_errors       → mfrid específico NO existe en portal → PART_ERROR
+    #   2. scraped_by_mfrid_pn match   → fila exacta (portal_mfrid = mfrid solicitado)
+    #                                     ej: BS,4156 cuando PO pide BRS → evita NGK,4156
+    #   3. scraped_by_pn fallback      → cualquier fila con ese pn
+    #   4. scraped_by_superseded       → pn fue supersedido
+    #   5. fallback                    → _make_part_error
     results: List[Dict] = []
     for item in po_items:
         pn       = (item.get('part_number') or '').strip()
@@ -795,13 +847,18 @@ def _phase_2_item_by_item(
             results.append(part_errors[err_key])
 
         elif pn_up in scraped_by_pn:
-            # Este mfrid SÍ fue encontrado en portal → usar precio del scrape
-            scraped = _copy.deepcopy(scraped_by_pn[pn_up])
+            # Preferir la fila cuyo portal_mfrid coincide con el mfrid solicitado.
+            # BRS → BS (via _get_portal_mfrid).  Ej: tabla tiene BS,4156 y NGK,4156;
+            # para una PO con BRS usamos BS,4156 e ignoramos NGK,4156.
+            pmfrid = _get_portal_mfrid(mfrid).upper()
+            scraped = _copy.deepcopy(
+                scraped_by_mfrid_pn.get((pmfrid, pn_up)) or scraped_by_pn[pn_up]
+            )
             scraped['mfrid'] = mfrid   # preservar mfrid del PO body
             if is_ltl:
                 scraped['ltl'] = 'Y'
             print(
-                f"  💵 {mfrid},{pn} | Cost:{scraped.get('your_price')} | "
+                f"  💵 {mfrid},{pn} | portal_mfrid:{pmfrid} | Cost:{scraped.get('your_price')} | "
                 f"Status:{scraped.get('status')} | LTL:{scraped.get('ltl')}"
             )
             results.append(scraped)

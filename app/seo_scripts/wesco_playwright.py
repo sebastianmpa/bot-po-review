@@ -345,13 +345,25 @@ def wesco_automation_playwright(
                 price_block = node.query_selector('.price_block')
                 if price_block:
                     price_text = price_block.evaluate('''el => {
-                        // Identify the "Total" paragraph so we can exclude its value
+                        // STEP 1: buscar en <p class="cc_price"> cuyo contenido directo (text node) sea un precio.
+                        // Esto captura "$5.32" cuando está como texto directo en el <p> (sin span cc_value).
+                        for (const p of el.querySelectorAll('p.cc_price')) {
+                            const lbl = p.querySelector('.cc_label');
+                            if (lbl && lbl.textContent.includes('Total')) continue;
+                            // Solo nodos de texto directos (no hijos de span)
+                            const directText = Array.from(p.childNodes)
+                                .filter(n => n.nodeType === 3)
+                                .map(n => n.textContent.trim())
+                                .join('');
+                            if (/\\$[\\s]*[0-9]/.test(directText)) return directText;
+                        }
+                        // STEP 2: .cc_value que NO sea b2b_Suggested_Price ni esté dentro de Total
                         const totalPara = Array.from(el.querySelectorAll('p')).find(p => {
                             const lbl = p.querySelector('.cc_label');
                             return lbl && lbl.textContent.includes('Total');
                         });
-                        // Return the first .cc_value NOT contained inside the Total paragraph
                         for (const cv of el.querySelectorAll('.cc_value')) {
+                            if (cv.classList.contains('b2b_Suggested_Price')) continue;
                             if (totalPara && totalPara.contains(cv)) continue;
                             const t = cv.textContent.trim();
                             if (/\\$[\\s]*[0-9]/.test(t)) return t;
@@ -359,15 +371,25 @@ def wesco_automation_playwright(
                         return null;
                     }''')
 
-                # Fallback: same JS logic on the full node when price_block is absent
+                # Fallback: same logic on the full node when price_block is absent
                 if not price_text:
                     price_text = node.evaluate('''el => {
                         const pb = el.querySelector('.price_block') || el;
+                        for (const p of pb.querySelectorAll('p.cc_price')) {
+                            const lbl = p.querySelector('.cc_label');
+                            if (lbl && lbl.textContent.includes('Total')) continue;
+                            const directText = Array.from(p.childNodes)
+                                .filter(n => n.nodeType === 3)
+                                .map(n => n.textContent.trim())
+                                .join('');
+                            if (/\\$[\\s]*[0-9]/.test(directText)) return directText;
+                        }
                         const totalPara = Array.from(pb.querySelectorAll('p')).find(p => {
                             const lbl = p.querySelector('.cc_label');
                             return lbl && lbl.textContent.includes('Total');
                         });
                         for (const cv of pb.querySelectorAll('.cc_value')) {
+                            if (cv.classList.contains('b2b_Suggested_Price')) continue;
                             if (totalPara && totalPara.contains(cv)) continue;
                             const t = cv.textContent.trim();
                             if (/\\$[\\s]*[0-9]/.test(t)) return t;

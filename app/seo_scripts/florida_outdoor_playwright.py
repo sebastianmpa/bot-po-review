@@ -58,6 +58,12 @@ def _add_item_to_orderpad(page: Page, part_number: str, qty: int) -> tuple:
             'table.standardTable td[name^="cust_itemlink"]'
         ).count()
 
+        # Capturar error PREVIO antes del submit (puede quedar de operación anterior)
+        pre_error_text = ''
+        pre_err_el = page.locator('div.errorMessage, span.errorMessage')
+        if pre_err_el.count() > 0:
+            pre_error_text = pre_err_el.first.inner_text().strip()
+
         # Llenar campo de item number
         itm_input = page.locator('input[name="itm_num"]').first
         itm_input.wait_for(state='visible', timeout=5000)
@@ -85,12 +91,16 @@ def _add_item_to_orderpad(page: Page, part_number: str, qty: int) -> tuple:
                 pass
         time.sleep(1)
 
-        # ✅ PRIMERO: Capturar errores de validación ANTES de verificar la tabla
+        # ✅ PRIMERO: Capturar errores de validación, pero solo si son NUEVOS
+        # (distintos al error que ya existía antes del submit — evita re-leer errores anteriores)
         err_el = page.locator('div.errorMessage, span.errorMessage')
         if err_el.count() > 0:
-            error_text = err_el.first.inner_text().strip()[:200]
-            print(f"    ⚠️ Error de validación capturado: {error_text}")
-            return False, error_text
+            error_text = err_el.first.inner_text().strip()
+            if error_text != pre_error_text:
+                # Es un error nuevo — pertenece a este ítem
+                print(f"    ⚠️ Error de validación capturado: {error_text[:200]}")
+                return False, error_text[:200]
+            # Mismo error que antes — no es de este ítem, ignorar y verificar tabla
 
         # SEGUNDO: Verificar si el ítem apareció en la tabla
         after_count = page.locator(
@@ -100,7 +110,7 @@ def _add_item_to_orderpad(page: Page, part_number: str, qty: int) -> tuple:
             print(f"    ✅ Ítem {part_number} agregado exitosamente.")
             return True, None
 
-        # Si no hay error y no apareció = fallo silencioso
+        # Si no hay error nuevo y no apareció = fallo silencioso
         return False, f"Item not added to cart: {part_number}"
 
     except Exception as e:
@@ -326,6 +336,7 @@ def _scrape_cart_with_details(
     out_of_stock: Dict[str, str],
     po_mfr_map: Dict[str, str],
     po_mfr_orig_map: Dict[str, str],
+    on_item_ready=None,
 ) -> List[Dict]:
     """
     Scrapea TODAS las páginas de table.standardTable.
@@ -424,6 +435,8 @@ def _scrape_cart_with_details(
                 'pack_qty': pack_qty,
                 'ltl': None,
             })
+            if on_item_ready:
+                on_item_ready(all_results[-1])
 
         # Intentar ir a la siguiente página
         if _has_next_cart_page(page):
@@ -448,6 +461,7 @@ def florida_outdoor_automation_playwright(
     username: str,
     password: str,
     po_items: List[Dict],
+    on_item_ready=None,
 ) -> Optional[List[Dict]]:
     """
     Flujo ítem-a-ítem para Florida Outdoor Equipment.
@@ -549,9 +563,32 @@ def florida_outdoor_automation_playwright(
             if success:
                 print(f"    ✅ Añadido exitosamente.")
             else:
-                # ✅ GUARDAR ERROR EN MEMORIA para usarlo después en BD
-                invalid_items[part_number] = err_msg or f"No se pudo añadir: {part_number}"
-                print(f"    ❌ PART_ERROR capturado en memoria: {invalid_items[part_number]}")
+                error_msg = err_msg or f"No se pudo añadir: {part_number}"
+                invalid_items[part_number] = error_msg
+                print(f"    ❌ PART_ERROR capturado en memoria: {error_msg}")
+
+                # ✅ Llamar on_item_ready INMEDIATAMENTE para items fallidos
+                # (no esperar al final del scraping del carrito)
+                if on_item_ready:
+                    failed_item = {
+                        'mfrid':          po_mfr_map.get(part_number, ''),
+                        'mfrid_orig':     po_mfr_orig_map.get(part_number, ''),
+                        'part_number':    part_number,
+                        'description':    '',
+                        'qty':            requested_qtys.get(part_number, qty),
+                        'requested_qty':  requested_qtys.get(part_number, qty),
+                        'list_price':     None,
+                        'your_price':     None,
+                        'qty_available':  0,
+                        'in_stock':       'N',
+                        'status':         'PART_ERROR',
+                        'error_message':  error_msg,
+                        'nla':            None,
+                        'superseded_from':None,
+                        'pack_qty':       None,
+                        'ltl':            None,
+                    }
+                    on_item_ready(failed_item)
 
         added = len(po_items) - len(invalid_items)
         print(f"\n📊 {added}/{len(po_items)} ítems en carrito. {len(invalid_items)} fallidos.")
@@ -574,7 +611,7 @@ def florida_outdoor_automation_playwright(
         cart_items: List[Dict] = []
         if page.locator('table.standardTable').count() > 0:
             print("📊 Scrapeando carrito con detalles de stock...")
-            cart_items = _scrape_cart_with_details(page, requested_qtys, out_of_stock, po_mfr_map, po_mfr_orig_map)
+            cart_items = _scrape_cart_with_details(page, requested_qtys, out_of_stock, po_mfr_map, po_mfr_orig_map, on_item_ready)
             print(f"✅ {len(cart_items)} ítem(s) procesados del carrito.")
         else:
             print("⚠️ No se encontró table.standardTable.")
@@ -587,10 +624,9 @@ def florida_outdoor_automation_playwright(
         cart_part_numbers = {r['part_number'] for r in cart_items}
         for part, error_msg in invalid_items.items():
             if part not in cart_part_numbers:
-                # ✅ ASEGURAR que el error capturado se preserva en la estructura final
                 cart_items.append({
-                    'mfrid': po_mfr_map.get(part, ''),  # ✅ DEL BODY
-                    'mfrid_orig': po_mfr_orig_map.get(part, ''),  # ✅ DEL BODY
+                    'mfrid': po_mfr_map.get(part, ''),
+                    'mfrid_orig': po_mfr_orig_map.get(part, ''),
                     'part_number': part,
                     'description': '',
                     'qty': requested_qtys.get(part, 0),
@@ -600,13 +636,14 @@ def florida_outdoor_automation_playwright(
                     'qty_available': 0,
                     'in_stock': 'N',
                     'status': 'PART_ERROR',
-                    'error_message': error_msg,  # ✅ PRESERVAR ERROR EN MEMORIA
+                    'error_message': error_msg,
                     'nla': None,
                     'superseded_from': None,
                     'pack_qty': None,
                     'ltl': None,
                 })
-                print(f"  ℹ️ Ítem fallido {part} agregado a resultados con error: {error_msg}")
+                # on_item_ready ya fue llamado inmediatamente al detectar el error
+                print(f"  ℹ️ Ítem fallido {part} consolidado en resultados.")
 
         ok = sum(1 for r in cart_items if r['status'] == 'CORRECT')
         errors = sum(1 for r in cart_items if r['status'] == 'PART_ERROR')
