@@ -21,6 +21,18 @@ from seo_scripts.gardner_login_playwright import gardner_login_automation_playwr
 from seo_scripts.insert_data_in_db import insert_po_review_details
 
 
+# Mapping: código de 3 letras del portal Gardner → código Ideal (sistema interno)
+# El portal acortó algunos mfrid a 3 dígitos; hay que restaurarlos antes de guardar.
+_GARDNER_MFRID_NORMALIZE: Dict[str, str] = {
+    'AGR': 'AGRI',
+    'HYG': 'HG',
+    'HOM': 'HOME',
+    'TIL': 'TILL',
+    'WLB': 'WALB',
+    'TUF': 'TUFF',
+}
+
+
 class GardnerSupplierService(SupplierService):
     """
     Estrategia concreta para Gardner Inc.
@@ -101,6 +113,12 @@ class GardnerSupplierService(SupplierService):
         for item in scraped_data:
             part_number: str = item["part_number"]
             supplier_price: Optional[Decimal] = item.get("your_price")
+
+            # Normalizar mfrid Gardner → Ideal antes de cualquier lookup o salida.
+            # El portal Gardner recorta algunos códigos a 3 letras (AGR, HYG, …);
+            # los convertimos al código del sistema Ideal (AGRI, HG, …).
+            raw_mfrid = (item.get("mfrid") or "").strip()
+            item["mfrid"] = _GARDNER_MFRID_NORMALIZE.get(raw_mfrid.upper(), raw_mfrid)
 
             # --- Resolver ideal_cost y mfrid ---
             ideal_cost = ideal_costs.get(part_number, 0.0)
