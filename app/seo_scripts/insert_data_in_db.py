@@ -297,25 +297,26 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
         # Query de inserción — ON DUPLICATE KEY UPDATE para tolerar re-ejecuciones
         insert_query = """
         INSERT INTO po_review_details 
-        (po_number, mfrid, mfrid_orig, part_number, partnumber_orig, qty, ideal_cost, supplier_price, available_qty, in_stock, status, error_message, superseded_from, nla, pack_qty, ltl, supplier_code, pack_codes, crossover)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        (po_number, mfrid, mfrid_orig, part_number, partnumber_orig, qty, ideal_cost, supplier_price, available_qty, in_stock, status, error_message, superseded_from, nla, pack_qty, ltl, supplier_code, pack_codes, crossover, supplier_list_price)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
-            mfrid_orig      = VALUES(mfrid_orig),
-            partnumber_orig = VALUES(partnumber_orig),
-            qty             = VALUES(qty),
-            ideal_cost      = VALUES(ideal_cost),
-            supplier_price  = VALUES(supplier_price),
-            available_qty   = VALUES(available_qty),
-            in_stock        = VALUES(in_stock),
-            status          = VALUES(status),
-            error_message   = VALUES(error_message),
-            superseded_from = VALUES(superseded_from),
-            nla             = VALUES(nla),
-            pack_qty        = VALUES(pack_qty),
-            ltl             = VALUES(ltl),
-            supplier_code   = VALUES(supplier_code),
-            pack_codes      = VALUES(pack_codes),
-            crossover       = VALUES(crossover)
+            mfrid_orig         = VALUES(mfrid_orig),
+            partnumber_orig    = VALUES(partnumber_orig),
+            qty                = VALUES(qty),
+            ideal_cost         = VALUES(ideal_cost),
+            supplier_price     = VALUES(supplier_price),
+            available_qty      = VALUES(available_qty),
+            in_stock           = VALUES(in_stock),
+            status             = VALUES(status),
+            error_message      = VALUES(error_message),
+            superseded_from    = VALUES(superseded_from),
+            nla                = VALUES(nla),
+            pack_qty           = VALUES(pack_qty),
+            ltl                = VALUES(ltl),
+            supplier_code      = VALUES(supplier_code),
+            pack_codes         = VALUES(pack_codes),
+            crossover          = VALUES(crossover),
+            supplier_list_price = VALUES(supplier_list_price)
         """
         
         # Insertar cada fila
@@ -406,6 +407,12 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
                 if in_stock_value is None:
                     in_stock_value = 'Y' if available_qty_value > 0 else 'N'
                 
+                # supplier_list_price: list_price del scraper (SRP en Wesco, List en otros).
+                # Husqvarna y CP no tienen este dato aun → None.
+                supplier_list_price_value = item.get('list_price')
+                if supplier_list_price_value is not None:
+                    supplier_list_price_value = float(supplier_list_price_value)
+
                 # Preparar valores para inserción
                 values = (
                     item['po_number'],
@@ -427,6 +434,7 @@ def insert_po_review_details(scraped_data: List[Dict]) -> int:
                     item.get('supplier_code'), # GA, HU, SP, FO, CP ...
                     pack_codes_json,           # JSON array o None
                     crossover_json,            # JSON array o None
+                    supplier_list_price_value, # list_price del scraper (SRP/List)
                 )
                 
                 # Ejecutar inserción

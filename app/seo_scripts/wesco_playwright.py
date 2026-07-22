@@ -410,15 +410,23 @@ def wesco_automation_playwright(
                     your_price = _parse_price(price_text)
                     print(f"  💰 Precio individual extraído: {price_text} → {your_price}")
 
+                # SRP: extraer explícitamente b2b_Suggested_Price como supplier_list_price.
+                # Es el precio $34.99 que aparece al lado del label "SRP".
                 list_price = None
-                list_selectors = ['.list_price .cc_value', '.list_price', '.was_price', '.b2b_Suggested_Price']
-                for sel in list_selectors:
-                    ln = node.query_selector(sel)
-                    if ln:
-                        lp = ln.inner_text().strip()
-                        if lp and re.search(r'[0-9]', lp):
-                            list_price = _parse_price(lp)
-                            break
+                srp_node = node.query_selector('.b2b_Suggested_Price')
+                if srp_node:
+                    srp_text = srp_node.inner_text().strip()
+                    if srp_text and re.search(r'[0-9]', srp_text):
+                        list_price = _parse_price(srp_text)
+                # Fallback: otros selectores de precio de lista
+                if list_price is None:
+                    for sel in ['.list_price .cc_value', '.list_price', '.was_price']:
+                        ln = node.query_selector(sel)
+                        if ln:
+                            lp = ln.inner_text().strip()
+                            if lp and re.search(r'[0-9]', lp):
+                                list_price = _parse_price(lp)
+                                break
 
                 avail_text = None
                 in_stock = None

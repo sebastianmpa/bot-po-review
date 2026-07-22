@@ -70,7 +70,12 @@ class GardnerSupplierService(SupplierService):
         return ["MANUFACTURER", "PART NUMBER", "QUANTITY"]
 
     def csv_row(self, product: PurchaseOrderItemModel) -> List:
-        return [product.mfrid, product.partNumber, product.qty]
+        # Oregon (ORG) no existe en el portal Gardner con ese código.
+        # Si enviamos el mfrid, Gardner marca PART_ERROR porque no lo reconoce.
+        # Solución: enviar mfrid vacío para que Gardner busque solo por part number.
+        _MFRID_BLANK_FOR_GARDNER = {'ORG'}  # añadir otros si aparecen
+        mfrid_csv = '' if (product.mfrid or '').upper() in _MFRID_BLANK_FOR_GARDNER else product.mfrid
+        return [mfrid_csv, product.partNumber, product.qty]
 
     # ------------------------------------------------------------------ #
     #  Automatización                                                       #
